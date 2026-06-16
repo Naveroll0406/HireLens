@@ -1,6 +1,6 @@
 # HireLens 🔍
 
-Automated AI Job Discovery & Monitoring Tool
+Automated Job Discovery & Monitoring Tool
 
 HireLens is an intelligent, automated LinkedIn monitor built to aggressively discover and filter AI, GenAI, LLM, and RAG engineering opportunities directly from LinkedIn posts. By bypassing standard job boards, it taps into the "hidden job market" where founders and hiring managers post directly to their network.
 
