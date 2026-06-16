@@ -55,10 +55,6 @@ You can fully customize the behavior of the scraper without touching a single li
    pip install -r requirements.txt
    playwright install
    ```
-3. Copy the example environment file and add your LinkedIn credentials (don't worry, these stay completely local!):
-   ```bash
-   cp .env.example .env
-   ```
 
 ### Usage
 
