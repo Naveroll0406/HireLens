@@ -8,7 +8,7 @@ HireLens is an intelligent, automated LinkedIn monitor built to aggressively dis
 
 - **Immune to Obfuscation**: Uses advanced Playwright structural traversing to reliably scrape posts even when LinkedIn dynamically scrambles its CSS class names.
 - **Smart Deduplication**: Merges overlapping post fragments into pristine, single job opportunities without spamming your dashboard.
-- **AI-Powered Filtering**: A manual lightning-fast heuristic engine that instantly filters out noise, ensuring only highly relevant AI engineering jobs reach your screen.
+- **Rule-Based Filtering**: A manual, lightning-fast heuristic engine that instantly filters out noise using Regex and text matching, ensuring only highly relevant engineering jobs reach your screen.
 - **Frankenstein-Proof**: Rigorous safeguards that prevent it from mistakenly scraping the webpage wrapper or footer metadata.
 - **Live Streamlit Dashboard**: Instantly view, sort, and analyze scraped hiring posts with a modern, fast, and beautiful UI.
 
