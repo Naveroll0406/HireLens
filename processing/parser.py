@@ -346,7 +346,7 @@ def detect_hiring_signal(text: str) -> tuple[bool, float]:
         # Spam & Job Seekers
         "cfbr", "commenting for better reach", "whatsapp community", "join our whatsapp", 
         "join my whatsapp", "daily fresher job", "telegram channel", "telegram group",
-        "opentowork", "#opentowork", "seeking a new role", "looking for a job",
+        "seeking a new role", "looking for a job", "open to work", "i am open to work",
         "hire me", "my resume", "laid off", "layoff", "seeking a job",
         "seeking new opportunities", "looking for new opportunities",
         "please find my resume", "i am looking for", "i'm looking for",
