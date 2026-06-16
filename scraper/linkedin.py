@@ -177,23 +177,33 @@ class LinkedInScraper:
             logger.error("Redirected to login page. Session may have expired.")
             return []
 
-        # Scroll to load more posts
-        await human_scroll(
-            self._page,
-            times=config.SCROLL_COUNT,
-            min_delay=config.SCROLL_DELAY_MIN,
-            max_delay=config.SCROLL_DELAY_MAX,
-        )
-
-        # Extract posts
-        posts = await self._extract_posts(keyword)
+        # Scroll and extract in chunks to prevent LinkedIn from unmounting older posts from the virtual DOM
+        all_posts = []
+        seen_texts = set()
+        
+        scrolls_remaining = config.SCROLL_COUNT
+        while scrolls_remaining > 0:
+            chunk = min(3, scrolls_remaining)
+            await human_scroll(
+                self._page,
+                times=chunk,
+                min_delay=config.SCROLL_DELAY_MIN,
+                max_delay=config.SCROLL_DELAY_MAX,
+            )
+            scrolls_remaining -= chunk
+            
+            current_posts = await self._extract_posts(keyword)
+            for p in current_posts:
+                if p.content and p.content not in seen_texts:
+                    all_posts.append(p)
+                    seen_texts.add(p.content)
 
         logger.info(
             "Found %d posts for '%s'.",
-            len(posts), keyword,
+            len(all_posts), keyword,
         )
 
-        return posts
+        return all_posts
 
     async def search_direct_url(self, url: str) -> list[RawPost]:
         """Scrape posts from a user-provided LinkedIn search URL directly.
@@ -260,24 +270,42 @@ class LinkedInScraper:
         except Exception as e:
             logger.debug("Failed to read scroll_duration_seconds from DB: %s", e)
 
-        # Scroll to load more posts continuously for the configured duration
-        logger.info("Starting %d-second continuous scroll down the posts feed...", scroll_duration)
-        await human_scroll_for_duration(
-            self._page,
-            duration_seconds=scroll_duration,
-            min_delay=config.SCROLL_DELAY_MIN,
-            max_delay=config.SCROLL_DELAY_MAX,
-        )
+        # Scroll and extract continuously to prevent virtual DOM unmounting
+        logger.info("Starting %d-second continuous scroll and extract down the posts feed...", scroll_duration)
+        
+        import time
+        start_time = time.time()
+        
+        all_posts = []
+        seen_texts = set()
+        
+        while time.time() - start_time < scroll_duration:
+            # Scroll a few times (roughly 3-6 seconds)
+            await human_scroll(
+                self._page,
+                times=3,
+                min_delay=config.SCROLL_DELAY_MIN,
+                max_delay=config.SCROLL_DELAY_MAX,
+            )
+            
+            # Extract currently visible posts before LinkedIn unmounts them
+            current_posts = await self._extract_posts(keyword_tag, limit=1000)
+            
+            # Deduplicate chunks locally
+            for p in current_posts:
+                if p.content and p.content not in seen_texts:
+                    all_posts.append(p)
+                    seen_texts.add(p.content)
+                    
+            elapsed = int(time.time() - start_time)
+            logger.info("Scrolling... %ds elapsed of %ds. Captured %d posts so far.", elapsed, scroll_duration, len(all_posts))
 
-        # Extract posts (grab up to 1000 since we scrolled so much)
-        posts = await self._extract_posts(keyword_tag, limit=1000)
-
-        if not posts:
+        if not all_posts:
             logger.warning("No posts found. Taking debug screenshot...")
             await self.take_screenshot("no_posts_found")
 
-        logger.info("Found %d posts from direct URL.", len(posts))
-        return posts
+        logger.info("Found %d posts from direct URL.", len(all_posts))
+        return all_posts
 
     async def search_all_keywords(self, keywords: list[str]) -> list[RawPost]:
         """Search for all keywords with delays between searches.
