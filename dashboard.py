@@ -1068,7 +1068,7 @@ def render_job_card(row):
         source_platform = f"LinkedIn + {detected_platform}"
     platform_html = f'<span class="platform-badge">📡 {source_platform}</span>'
 
-    # --- Source post link & Admin profile link ---
+    # --- Source post link (Author Profile) ---
     author_url = row.get("author_url", "")
     if pd.isna(author_url):
         author_url = ""
@@ -1076,36 +1076,17 @@ def render_job_card(row):
     post_urn = row.get("post_urn", "")
     if pd.isna(post_urn):
         post_urn = ""
-        
-    if post_url and "/company/" in post_url and post_urn:
-        # Fix old records that incorrectly used company_url as post_url
-        post_url = f"https://www.linkedin.com/feed/update/{post_urn}"
-        
-    if not post_url and post_urn:
-        post_url = f"https://www.linkedin.com/feed/update/{post_urn}"
 
-    # Build source section with admin profile link prominently displayed
+    # Build source section using ONLY the extracted author URL
     source_parts = []
 
-    # Admin/Author profile link — shown first and prominently for verification
     if author_url:
-        if "/company/" in author_url:
-            profile_label = "🏢 Company Page"
-            profile_type = "Company"
-        else:
-            profile_label = "👤 Admin Profile"
-            profile_type = "Profile"
         source_parts.append(f'''
         <div style="background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.2); border-radius:10px; padding:0.6rem 0.8rem; margin-bottom:0.5rem;">
-            <div style="font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--accent-purple); margin-bottom:0.3rem;">🔍 Verify Source — {profile_type}</div>
-            <a href="{author_url}" target="_blank" style="display:inline-flex; align-items:center; gap:0.4rem; padding:0.35rem 0.8rem; background:rgba(168,85,247,0.15); color:var(--accent-purple); border:1px solid rgba(168,85,247,0.3); border-radius:8px; text-decoration:none; font-weight:600; font-size:0.82rem; transition:all 0.25s ease;">{profile_label} →</a>
+            <div style="font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--accent-purple); margin-bottom:0.3rem;">🔍 Verify Source</div>
+            <a href="{author_url}" target="_blank" style="display:inline-flex; align-items:center; gap:0.4rem; padding:0.35rem 0.8rem; background:rgba(168,85,247,0.15); color:var(--accent-purple); border:1px solid rgba(168,85,247,0.3); border-radius:8px; text-decoration:none; font-weight:600; font-size:0.82rem; transition:all 0.25s ease;">🔗 View Source Page →</a>
             <div style="font-size:0.72rem; color:var(--text-muted); margin-top:0.3rem; word-break:break-all;">{author_url}</div>
         </div>''')
-
-    # Post source link
-    if post_url:
-        source_parts.append(f'<div style="margin-bottom:0.5rem;"><a href="{post_url}" target="_blank" class="job-link" style="margin-right: 1rem;">🔗 View Source Post on LinkedIn</a></div>')
-        source_parts.append(f'<div style="font-size:0.75rem;color:var(--text-muted);word-break:break-all;margin-bottom:0.3rem;"><strong>Post URL:</strong> <a href="{post_url}" target="_blank" style="color:var(--accent-blue);text-decoration:none;">{post_url}</a></div>')
 
     source_link_html = "<div style='margin-top: 0.6rem; padding-top:0.5rem; border-top:1px solid rgba(255,255,255,0.06);'>" + "".join(source_parts) + "</div>" if source_parts else ""
 

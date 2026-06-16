@@ -31,10 +31,22 @@ class RawPost:
     @property
     def content_hash(self) -> str:
         """SHA-256 hash of normalized content for deduplication."""
+        import re
         normalized = self.content.lower().strip()
-        # Remove extra whitespace
-        normalized = " ".join(normalized.split())
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        # Remove all numbers to ignore changing likes, comments, and dates
+        normalized = re.sub(r'\d+', '', normalized)
+        # Remove common LinkedIn UI noise words that might get caught in innerText
+        noise = ['likes', 'like', 'comments', 'comment', 'reposts', 'repost', 'send', 'share', 'h', 'd', 'w', 'm']
+        for word in noise:
+            normalized = re.sub(rf'\b{word}\b', '', normalized)
+            
+        author = re.sub(r'[^a-z]', '', self.author_name.lower().strip())
+        
+        # Remove extra whitespace and take first 200 chars to avoid trailing dynamic content
+        normalized = " ".join(normalized.split())[:200]
+        
+        core_text = f"{author}_{normalized}"
+        return hashlib.sha256(core_text.encode("utf-8")).hexdigest()
 
 
 @dataclass

@@ -539,7 +539,7 @@ class LinkedInScraper:
                 if href and not href.startswith("http"):
                     href = f"https://www.linkedin.com{href}"
                 if href:
-                    post_url = href
+                    post_url = href.split("?")[0]
                     break
             if post_url:
                 break
@@ -565,6 +565,21 @@ class LinkedInScraper:
                     # Clean off tracking params
                     author_url = href.split("?")[0]
                     break
+
+        if not author_url:
+            # Fallback: scan all links in the element for a profile/company link
+            try:
+                all_links = await element.query_selector_all("a[href]")
+                for link_el in all_links:
+                    href = await link_el.get_attribute("href") or ""
+                    if "/in/" in href or "/company/" in href:
+                        href = href.split("?")[0]
+                        if not href.startswith("http"):
+                            href = f"https://www.linkedin.com{href}"
+                        author_url = href
+                        break
+            except Exception as e:
+                pass
 
         # --- Extracted URLs from <a> elements ---
         extracted_urls: list[str] = []

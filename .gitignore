@@ -1,10 +1,14 @@
 # Environment and Secrets
 .env
-__pycache__/
-*.pyc
 .venv/
 venv/
 env/
+
+# Caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
 
 # Database and Scraped Data
 data/
@@ -16,6 +20,3 @@ logs/
 .vscode/
 .idea/
 .DS_Store
-
-# Ignore the dead llm code folder
-llm/

@@ -29,6 +29,15 @@ HireLens is an intelligent, automated LinkedIn monitor built to aggressively dis
 3. **Filtering & Deduping**: It identifies true "hiring" signals and filters by your desired experience level and target locations, deduplicating identical posts across multiple runs.
 4. **Dashboard Delivery**: The processed and cleaned posts are instantly loaded into your local dashboard with direct `apply` links.
 
+## ⚙️ Configuration & Settings
+
+You can fully customize the behavior of the scraper without touching a single line of code! Just use the **⚙️ Settings** menu in the dashboard sidebar:
+
+- **Scroll Duration (seconds):** Controls exactly how long the scraper spends continuously scrolling down the feed. Increase this number to scrape much deeper into the feed's history.
+- **Scheduler Timer (minutes):** Controls how frequently the background scraper automatically wakes up to hunt for new jobs on autopilot.
+
+*Any changes you make in the dashboard are saved permanently to your local SQLite database.*
+
 ## 💻 Getting Started
 
 ### Prerequisites
