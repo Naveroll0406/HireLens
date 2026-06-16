@@ -348,8 +348,34 @@ class LinkedInScraper:
         limit = limit or config.MAX_POSTS_PER_KEYWORD
 
         # LinkedIn post containers — try multiple selectors for resilience
-        # (LinkedIn frequently changes class names, so we need many variants)
+        # Inject a custom class to completely bypass LinkedIn's class obfuscation
+        await self._page.evaluate("""
+            () => {
+                const boxes = document.querySelectorAll('[data-testid="expandable-text-box"], [componentkey*="feed-commentary"], .update-components-text');
+                for (const box of boxes) {
+                    let container = box.closest('li.reusable-search__result-container, div[data-urn], div[data-chameleon-result-urn], div.feed-shared-update-v2, div.occludable-update, li[class*="search__result"], li');
+                    
+                    if (!container) {
+                        let parent = box.parentElement;
+                        for(let i=0; i<6; i++) {
+                            if(!parent) break;
+                            if (parent.querySelector('img') || parent.querySelector('a[href*="/in/"]')) {
+                                container = parent;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    
+                    if (container && container.tagName !== 'BODY' && container.tagName !== 'MAIN' && !container.id.includes('global-nav')) {
+                        container.classList.add('hirelens-post-container');
+                    }
+                }
+            }
+        """)
+
         selectors = [
+            ".hirelens-post-container",
             "div.feed-shared-update-v2",
             "div[data-urn*='urn:li:activity']",
             "div[data-urn*='urn:li:share']",
@@ -360,13 +386,6 @@ class LinkedInScraper:
             "div[data-chameleon-result-urn]",
             "ul.reusable-search__entity-result-list > li",
             "div.search-results__list > div",
-            # Resilient wildcard selectors for LinkedIn's changing DOM
-            "li[class*='search__result']",
-            "div[class*='feed-shared-update']",
-            "article[class*='feed']",
-            # Structural selectors based on custom attributes (immune to class obfuscation)
-            "li:has([data-testid='expandable-text-box'])",
-            "li:has([componentkey*='feed-commentary'])"
         ]
 
         post_elements = []
@@ -586,14 +605,31 @@ class LinkedInScraper:
         limit = limit or config.MAX_POSTS_PER_KEYWORD
 
         try:
-            # Use structural selectors based on custom attributes, but STRICTLY avoid `div:has()` 
-            # because it matches the entire page body wrapper, creating a giant combined post.
-            text_blocks = await self._page.query_selector_all(
-                "li:has([data-testid='expandable-text-box']), "
-                "li:has([componentkey*='feed-commentary']), "
-                "div[data-urn*='urn:li:activity'], "
-                "li[class*='search__result']"
-            )
+            # Tag containers dynamically via JavaScript to avoid matching the root page wrapper
+            await self._page.evaluate("""
+                () => {
+                    const boxes = document.querySelectorAll('[data-testid="expandable-text-box"], [componentkey*="feed-commentary"], .update-components-text');
+                    for (const box of boxes) {
+                        let container = box.closest('li.reusable-search__result-container, div[data-urn], div[data-chameleon-result-urn], div.feed-shared-update-v2, div.occludable-update, li[class*="search__result"], li');
+                        if (!container) {
+                            let parent = box.parentElement;
+                            for(let i=0; i<6; i++) {
+                                if(!parent) break;
+                                if (parent.querySelector('img') || parent.querySelector('a[href*="/in/"]')) {
+                                    container = parent;
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
+                        if (container && container.tagName !== 'BODY' && container.tagName !== 'MAIN' && !container.id.includes('global-nav')) {
+                            container.classList.add('hirelens-fallback-container');
+                        }
+                    }
+                }
+            """)
+
+            text_blocks = await self._page.query_selector_all(".hirelens-fallback-container")
 
             # If none found, fall back to deeper text blocks
             if not text_blocks:
