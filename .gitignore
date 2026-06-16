@@ -16,3 +16,6 @@ logs/
 .vscode/
 .idea/
 .DS_Store
+
+# Ignore the dead llm code folder
+llm/
