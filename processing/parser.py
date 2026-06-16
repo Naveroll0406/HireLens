@@ -343,6 +343,7 @@ def detect_hiring_signal(text: str) -> tuple[bool, float]:
     # 1. ABSOLUTE REJECTION (Kill List)
     # If any of these are present, immediately reject the post.
     absolute_rejects = [
+        # Spam & Job Seekers
         "cfbr", "commenting for better reach", "whatsapp community", "join our whatsapp", 
         "join my whatsapp", "daily fresher job", "telegram channel", "telegram group",
         "opentowork", "#opentowork", "seeking a new role", "looking for a job",
@@ -350,7 +351,12 @@ def detect_hiring_signal(text: str) -> tuple[bool, float]:
         "seeking new opportunities", "looking for new opportunities",
         "please find my resume", "i am looking for", "i'm looking for",
         "i am actively looking", "i'm actively looking", "kindly review my profile",
-        "can you solve these", "mcq", "test your fundamentals", "spammers stay away"
+        "can you solve these", "mcq", "test your fundamentals", "spammers stay away",
+        
+        # Non-AI / Standard Web & Enterprise Roles (false positives)
+        "java full stack", "java developer", "sap abap", "sap hana", "react developer",
+        "frontend developer", "front-end developer", "angular developer", ".net developer",
+        "dotnet developer", "php developer", "laravel developer", "wordpress developer"
     ]
     for reject in absolute_rejects:
         if reject in text_lower:
