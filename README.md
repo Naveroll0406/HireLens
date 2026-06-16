@@ -61,11 +61,21 @@ You can fully customize the behavior of the scraper without touching a single li
    ```
 
 ### Usage
-Run the dashboard directly via Streamlit:
+
+HireLens operates using two parallel processes. You can run one or both depending on your needs.
+
+#### 1. The Dashboard (UI)
+Run the dashboard directly via Streamlit to view results and manually trigger scrapers:
 ```bash
 streamlit run dashboard.py
 ```
-From the dashboard, paste a LinkedIn Search URL and hit **🚀 Run Scraper**!
+
+#### 2. The Autopilot Scheduler (Background Monitor)
+To run the scraper on a continuous, fully automated loop (based on your Scheduler Timer setting), run the scheduler script in a separate terminal:
+```bash
+python scheduler.py
+```
+*Leave this terminal open, and it will continuously hunt for new jobs in the background!*
 
 ---
 
