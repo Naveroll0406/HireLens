@@ -339,30 +339,43 @@ def detect_hiring_signal(text: str) -> tuple[bool, float]:
     Returns (is_hiring, confidence) where confidence is 0.0 to 1.0.
     """
     text_lower = text.lower()
+    
+    # 1. ABSOLUTE REJECTION (Kill List)
+    # If any of these are present, immediately reject the post.
+    absolute_rejects = [
+        "cfbr", "commenting for better reach", "whatsapp community", "join our whatsapp", 
+        "join my whatsapp", "daily fresher job", "telegram channel", "telegram group",
+        "opentowork", "#opentowork", "seeking a new role", "looking for a job",
+        "hire me", "my resume", "laid off", "layoff", "seeking a job",
+        "seeking new opportunities", "looking for new opportunities",
+        "please find my resume", "i am looking for", "i'm looking for",
+        "i am actively looking", "i'm actively looking", "kindly review my profile",
+        "can you solve these", "mcq", "test your fundamentals", "spammers stay away"
+    ]
+    for reject in absolute_rejects:
+        if reject in text_lower:
+            return (False, 0.0)
+
+    # 2. Weighted Signals
     hiring_hits = 0
     non_hiring_hits = 0
 
-    # Count hiring signal matches
     for signal in config.HIRING_SIGNALS:
         if signal.lower() in text_lower:
             hiring_hits += 1
 
-    # Count non-hiring signal matches
     for signal in config.NON_HIRING_SIGNALS:
         if signal.lower() in text_lower:
             non_hiring_hits += 1
 
-    # Scoring logic
     if hiring_hits == 0:
         return (False, 0.0)
 
     if non_hiring_hits > hiring_hits:
         return (False, 0.2)
 
-    # Confidence based on number of hiring signals found
     confidence = min(1.0, hiring_hits * 0.25)
 
-    # Boost if strong signals are present
     strong_signals = ["hiring", "#hiring", "apply", "looking for", "we're hiring"]
     for strong in strong_signals:
         if strong in text_lower:
