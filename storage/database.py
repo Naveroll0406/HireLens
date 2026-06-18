@@ -139,17 +139,17 @@ class Database:
     # Posts
     # ------------------------------------------------------------------
 
-    def is_duplicate(self, post_urn: str, content_hash: str) -> bool:
-        """Check if a post already exists by URN or content hash."""
+    def is_duplicate(self, post_urn: str, content_hash: str, author_name: str) -> bool:
+        """Check if a post already exists by URN, or by exact same content from the same author."""
         if post_urn:
             cursor = self.conn.execute(
-                "SELECT 1 FROM posts WHERE post_urn = ? OR content_hash = ? LIMIT 1",
-                (post_urn, content_hash),
+                "SELECT 1 FROM posts WHERE post_urn = ? OR (content_hash = ? AND author_name = ?) LIMIT 1",
+                (post_urn, content_hash, author_name),
             )
         else:
             cursor = self.conn.execute(
-                "SELECT 1 FROM posts WHERE content_hash = ? LIMIT 1",
-                (content_hash,),
+                "SELECT 1 FROM posts WHERE content_hash = ? AND author_name = ? LIMIT 1",
+                (content_hash, author_name),
             )
         return cursor.fetchone() is not None
 

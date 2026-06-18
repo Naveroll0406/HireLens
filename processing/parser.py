@@ -117,32 +117,47 @@ def extract_role(text: str, author_headline: str = "") -> Optional[str]:
     return None
 
 
-def extract_experience(text: str) -> tuple[Optional[int], Optional[int]]:
+def extract_experience(text: str, role: Optional[str] = None) -> tuple[Optional[int], Optional[int]]:
     """Extract experience range from post text.
 
+    If a role is provided, it attempts to find the experience requirement physically closest to that role in the text.
     Returns (min_years, max_years). Either or both can be None.
     """
     # Check for fresher/entry-level first
     if FRESHER_PATTERNS.search(text):
         return (0, 1)
 
+    matches = []
+    
     for pattern in EXPERIENCE_PATTERNS:
-        match = pattern.search(text)
-        if match:
+        for match in pattern.finditer(text):
             groups = match.groups()
+            pos = match.start()
             if len(groups) == 2:
                 try:
-                    return (int(float(groups[0])), int(float(groups[1])))
+                    matches.append(((int(float(groups[0])), int(float(groups[1]))), pos))
                 except (ValueError, TypeError):
                     pass
             elif len(groups) == 1:
                 try:
-                    min_exp = int(float(groups[0]))
-                    return (min_exp, None)
+                    matches.append(((int(float(groups[0])), None), pos))
                 except (ValueError, TypeError):
                     pass
 
-    return (None, None)
+    if not matches:
+        return (None, None)
+        
+    if role:
+        role_pattern = re.compile(r"\b" + re.escape(role) + r"\b", re.IGNORECASE)
+        role_match = role_pattern.search(text)
+        if role_match:
+            role_pos = role_match.start()
+            matches.sort(key=lambda m: abs(m[1] - role_pos))
+            return matches[0][0]
+
+    # Default to first match if no role or role not found
+    matches.sort(key=lambda m: m[1])
+    return matches[0][0]
 
 
 def extract_locations(text: str) -> list[str]:
@@ -351,12 +366,7 @@ def detect_hiring_signal(text: str) -> tuple[bool, float]:
         "seeking new opportunities", "looking for new opportunities",
         "please find my resume", "i am looking for", "i'm looking for",
         "i am actively looking", "i'm actively looking", "kindly review my profile",
-        "can you solve these", "mcq", "test your fundamentals", "spammers stay away",
-        
-        # Non-AI / Standard Web & Enterprise Roles (false positives)
-        "java full stack", "java developer", "sap abap", "sap hana", "react developer",
-        "frontend developer", "front-end developer", "angular developer", ".net developer",
-        "dotnet developer", "php developer", "laravel developer", "wordpress developer"
+        "can you solve these", "mcq", "test your fundamentals", "spammers stay away"
     ]
     for reject in absolute_rejects:
         if reject in text_lower:
@@ -408,16 +418,26 @@ def detect_senior_role(text: str, role: Optional[str] = None) -> bool:
     return False
 
 
+import unicodedata
+
+def normalize_unicode(text: str) -> str:
+    """Normalize fancy Unicode characters (like mathematical bold) to standard ASCII."""
+    if not text:
+        return text
+    return unicodedata.normalize('NFKD', text)
+
+
 def parse_post(raw: RawPost) -> ParsedPost:
     """Parse a raw post and extract all structured information.
 
     This is the main entry point for V1 (regex-based) parsing.
     """
-    content = raw.content
+    content = normalize_unicode(raw.content)
+    author_headline = normalize_unicode(raw.author_headline)
 
     # Extract all fields
-    role = extract_role(content, raw.author_headline)
-    exp_min, exp_max = extract_experience(content)
+    role = extract_role(content, author_headline)
+    exp_min, exp_max = extract_experience(content, role)
     locations = extract_locations(content)
     skills = extract_skills(content)
     emails = extract_emails(content)

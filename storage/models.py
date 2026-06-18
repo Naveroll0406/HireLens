@@ -29,10 +29,18 @@ class RawPost:
     scraped_at: datetime = field(default_factory=datetime.now)
 
     @property
+    def clean_content(self) -> str:
+        """Returns the content with fancy Unicode formatting normalized to standard ASCII."""
+        import unicodedata
+        if not self.content:
+            return ""
+        return unicodedata.normalize('NFKD', self.content)
+
+    @property
     def content_hash(self) -> str:
         """SHA-256 hash of normalized content for deduplication."""
         import re
-        normalized = self.content.lower().strip()
+        normalized = self.clean_content.lower().strip()
         # Remove all numbers to ignore changing likes, comments, and dates
         normalized = re.sub(r'\d+', '', normalized)
         # Remove common LinkedIn UI noise words that might get caught in innerText

@@ -32,7 +32,7 @@ class Deduplicator:
         """
         new_posts: list[RawPost] = []
         seen_urns_this_batch: set[str] = set()
-        seen_hashes_this_batch: set[str] = set()
+        seen_hashes_this_batch: set[tuple[str, str]] = set()
 
         for post in posts:
             # Skip within-batch duplicates (same post from different keyword searches)
@@ -41,24 +41,26 @@ class Deduplicator:
                 continue
 
             content_hash = post.content_hash
-            if content_hash in seen_hashes_this_batch:
+            author_name = post.author_name or ""
+            
+            if (content_hash, author_name) in seen_hashes_this_batch:
                 logger.info("REJECTED (deduplication - batch hash dup): %s", post.post_urn[:30] if post.post_urn else "no-urn")
                 continue
 
             # Check against database (use content_hash if no URN)
             urn_for_check = post.post_urn or ""
-            if self.db.is_duplicate(urn_for_check, content_hash):
+            if self.db.is_duplicate(urn_for_check, content_hash, author_name):
                 logger.info("REJECTED (deduplication - DB dup): %s", post.post_urn[:30] if post.post_urn else "no-urn")
                 if post.post_urn:
                     seen_urns_this_batch.add(post.post_urn)
-                seen_hashes_this_batch.add(content_hash)
+                seen_hashes_this_batch.add((content_hash, author_name))
                 continue
 
             # Truly new post
             new_posts.append(post)
             if post.post_urn:
                 seen_urns_this_batch.add(post.post_urn)
-            seen_hashes_this_batch.add(content_hash)
+            seen_hashes_this_batch.add((content_hash, author_name))
 
         logger.info(
             "Deduplication: %d input → %d new (removed %d duplicates)",

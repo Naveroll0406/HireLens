@@ -91,20 +91,12 @@ def filter_by_location(parsed: ParsedPost,
 def filter_by_seniority(parsed: ParsedPost) -> tuple[bool, str]:
     """Reject posts that are clearly for senior positions.
 
-    Rules:
-    - If the role title contains senior keywords AND experience ≥ 5 → REJECT
-    - If just senior in title but experience is within range → ACCEPT (could be title inflation)
-    - Default → ACCEPT
+    (Disabled per user request: Senior AI/ML profiles will now be accepted)
     """
     if not parsed.is_senior_role:
         return (True, "Not a senior role")
 
-    # Senior title + high experience → reject
-    if parsed.experience_min is not None and parsed.experience_min >= 5:
-        return (False, f"Senior role with {parsed.experience_min}+ years required")
-
-    # Senior title but experience within range or not specified → accept with note
-    return (True, "Senior title but experience may be within range")
+    return (True, "Senior AI/ML role accepted (filter disabled)")
 
 
 def filter_by_hiring_signal(parsed: ParsedPost) -> tuple[bool, str]:
@@ -124,13 +116,24 @@ def filter_by_ai_role(parsed: ParsedPost) -> tuple[bool, str]:
     """Check if the post is strictly for an AI/ML role, rejecting QA, Backend, etc.
 
     Rules:
+    - If the role contains non-AI specializations (Java, QA, Data Engineer, etc.) without explicitly mentioning AI in the role → REJECT
     - If the extracted role matches any keyword in AI_ROLE_KEYWORDS → ACCEPT
     - If the original search keyword (keyword_matched) is in the role or content → ACCEPT
     - If the role is generic (Software Engineer, Developer) and content has AI skills → ACCEPT
     - Otherwise → REJECT
     """
-    content_lower = parsed.raw.content.lower() if parsed.raw.content else ""
+    content_lower = parsed.raw.clean_content.lower() if parsed.raw.clean_content else ""
     role_lower = parsed.role.lower() if parsed.role else ""
+
+    # 0. Explicit Kill List for Non-AI Roles (even if they mention ML in text)
+    non_ai_roles = [
+        "data engineer", "data analyst", "qa engineer", "test engineer", "automation engineer",
+        "frontend", "front-end", "backend", "back-end", "fullstack", "full-stack",
+        "devops", "cloud engineer", "system admin", "database administrator",
+        "react", "angular", "vue", "java developer", "c# developer", ".net"
+    ]
+    if any(r in role_lower for r in non_ai_roles) and not any(ai_kw.lower() in role_lower for ai_kw in config.AI_ROLE_KEYWORDS):
+        return (False, f"Role '{parsed.role}' explicitly rejected (Non-AI specialization)")
 
     # 1. Direct match with AI_ROLE_KEYWORDS
     for keyword in config.AI_ROLE_KEYWORDS:
