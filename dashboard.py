@@ -790,7 +790,7 @@ def render_header():
     """Render the main dashboard header."""
     st.markdown("""
     <div class="main-header">
-        <h1>🔍 LinkedIn AI Job Monitor</h1>
+        <h1>🔍 LinkedIn Job Finder</h1>
         <p>Automated discovery of AI, GenAI, LLM & RAG hiring opportunities from LinkedIn Posts</p>
     </div>
     """, unsafe_allow_html=True)

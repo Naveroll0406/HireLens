@@ -41,7 +41,7 @@ ROLE_PATTERNS = [
 EXPERIENCE_PATTERNS = [
     # "2-4 years" / "2 to 4 years" / "2 - 4 yrs" / "0.5 - 2 years"
     re.compile(
-        r"(\d{1,2}(?:\.\d+)?)\s*[-–to]+\s*(\d{1,2}(?:\.\d+)?)\s*(?:\+\s*)?(?:years?|yrs?|y)\b",
+        r"(\d{1,2}(?:\.\d+)?)\s*(?:[-–]|to|plus\s+to|\+\s*to)\s*(\d{1,2}(?:\.\d+)?)\s*(?:\+\s*)?(?:years?|yrs?|y)\b",
         re.IGNORECASE,
     ),
     # "2+ years" / "3+ yrs" / "1.5+ years"
@@ -59,9 +59,14 @@ EXPERIENCE_PATTERNS = [
         r"(\d{1,2}(?:\.\d+)?)\s*(?:years?|yrs?|y)\s+(?:of\s+)?(?:experience|exp)\b",
         re.IGNORECASE,
     ),
-    # "experience: 2-4 years"
+    # "experience: 2-4 years" or "exp : 2-4 yrs"
     re.compile(
-        r"experience\s*[:]\s*(\d{1,2}(?:\.\d+)?)\s*[-–to]+\s*(\d{1,2}(?:\.\d+)?)",
+        r"(?:experience|exp)\s*[:\-]?\s*(\d{1,2}(?:\.\d+)?)\s*(?:[-–]|to|plus\s+to|\+\s*to)\s*(\d{1,2}(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    # "Exp : 5 Years" / "Experience: 5+ years" / "Exp : 5 Years Above"
+    re.compile(
+        r"(?:experience|exp)\s*[:\-]?\s*(\d{1,2}(?:\.\d+)?)\s*(?:\+)?\s*(?:years?|yrs?|y)\b",
         re.IGNORECASE,
     ),
 ]
@@ -80,12 +85,7 @@ def extract_role(text: str, author_headline: str = "") -> Optional[str]:
     text_lower = text.lower()
     headline_lower = author_headline.lower().strip()
     
-    # First, try to exactly match one of our specified AI roles
-    for keyword in config.AI_ROLE_KEYWORDS:
-        if keyword.lower() in text_lower:
-            return keyword  # Return the canonical specified role
-            
-    # Next, try patterns specifically indicating hiring
+    # First, try patterns specifically indicating hiring
     hiring_patterns = [
         re.compile(
             r"(?:hiring|looking for|role|position|title)\s*[:\-]?\s*"
@@ -104,6 +104,12 @@ def extract_role(text: str, author_headline: str = "") -> Optional[str]:
                 continue
             return role
 
+    # Fallback to exact AI role match in the FIRST 200 characters (to avoid matching random mentions deep in the text)
+    intro_text = text_lower[:200]
+    for keyword in config.AI_ROLE_KEYWORDS:
+        if keyword.lower() in intro_text:
+            return keyword
+
     # Fallback to generic regex patterns
     for pattern in ROLE_PATTERNS:
         for match in pattern.finditer(text):
@@ -117,32 +123,49 @@ def extract_role(text: str, author_headline: str = "") -> Optional[str]:
     return None
 
 
-def extract_experience(text: str) -> tuple[Optional[int], Optional[int]]:
+def extract_experience(text: str, role: Optional[str] = None) -> tuple[Optional[int], Optional[int]]:
     """Extract experience range from post text.
 
+    If a role is provided, it attempts to find the experience requirement closest to the role's mention in the text.
     Returns (min_years, max_years). Either or both can be None.
     """
-    # Check for fresher/entry-level first
-    if FRESHER_PATTERNS.search(text):
-        return (0, 1)
+    matches = []
 
-    for pattern in EXPERIENCE_PATTERNS:
-        match = pattern.search(text)
-        if match:
+    # Find fresher matches
+    for match in FRESHER_PATTERNS.finditer(text):
+        matches.append((0, 1, match.start()))
+
+    # Find range matches
+    for pattern_idx, pattern in enumerate(EXPERIENCE_PATTERNS):
+        for match in pattern.finditer(text):
             groups = match.groups()
-            if len(groups) == 2:
-                try:
-                    return (int(float(groups[0])), int(float(groups[1])))
-                except (ValueError, TypeError):
-                    pass
-            elif len(groups) == 1:
-                try:
+            try:
+                if len(groups) >= 2 and groups[1] is not None:
                     min_exp = int(float(groups[0]))
-                    return (min_exp, None)
-                except (ValueError, TypeError):
-                    pass
+                    max_exp = int(float(groups[1]))
+                    matches.append((min_exp, max_exp, match.start()))
+                else:
+                    min_exp = int(float(groups[0]))
+                    matches.append((min_exp, None, match.start()))
+            except (ValueError, TypeError):
+                continue
 
-    return (None, None)
+    if not matches:
+        return (None, None)
+
+    # If a role was extracted, find its position in the text to associate the closest experience
+    if role:
+        role_pattern = re.compile(r"\b" + re.escape(role) + r"\b", re.IGNORECASE)
+        role_match = role_pattern.search(text)
+        if role_match:
+            role_pos = role_match.start()
+            # Sort matches by absolute distance to the role mention
+            matches.sort(key=lambda m: abs(m[2] - role_pos))
+            return (matches[0][0], matches[0][1])
+
+    # Default to the first experience mentioned in the text
+    matches.sort(key=lambda m: m[2])
+    return (matches[0][0], matches[0][1])
 
 
 def extract_locations(text: str) -> list[str]:
@@ -417,7 +440,7 @@ def parse_post(raw: RawPost) -> ParsedPost:
 
     # Extract all fields
     role = extract_role(content, raw.author_headline)
-    exp_min, exp_max = extract_experience(content)
+    exp_min, exp_max = extract_experience(content, role)
     locations = extract_locations(content)
     skills = extract_skills(content)
     emails = extract_emails(content)

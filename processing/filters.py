@@ -124,6 +124,7 @@ def filter_by_ai_role(parsed: ParsedPost) -> tuple[bool, str]:
     """Check if the post is strictly for an AI/ML role, rejecting QA, Backend, etc.
 
     Rules:
+    - If the role contains non-AI specializations (Java, QA, Data Engineer, etc.) without explicitly mentioning AI in the role → REJECT
     - If the extracted role matches any keyword in AI_ROLE_KEYWORDS → ACCEPT
     - If the original search keyword (keyword_matched) is in the role or content → ACCEPT
     - If the role is generic (Software Engineer, Developer) and content has AI skills → ACCEPT
@@ -131,6 +132,20 @@ def filter_by_ai_role(parsed: ParsedPost) -> tuple[bool, str]:
     """
     content_lower = parsed.raw.content.lower() if parsed.raw.content else ""
     role_lower = parsed.role.lower() if parsed.role else ""
+
+    # 0. Explicit Reject List for non-AI specializations
+    reject_roles = [
+        "data engineer", "java", "backend", "front-end", "frontend", "fullstack", "full-stack",
+        "qa", "quality assurance", "devops", "ios", "android", "react", "angular",
+        "c++", "c#", ".net", "php", "ruby", "sales", "marketing", "hr", "recruiter",
+        "scrum master", "agile coach", "project manager"
+    ]
+    
+    has_rejected_specialization = any(r in role_lower.split() or r in role_lower for r in reject_roles)
+    has_ai_keyword_in_role = any(kw.lower() in role_lower for kw in config.AI_ROLE_KEYWORDS)
+    
+    if has_rejected_specialization and not has_ai_keyword_in_role:
+        return (False, f"Role '{parsed.role}' is for a non-AI specialization")
 
     # 1. Direct match with AI_ROLE_KEYWORDS
     for keyword in config.AI_ROLE_KEYWORDS:
