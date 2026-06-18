@@ -36,7 +36,7 @@ class RawPost:
         # Remove all numbers to ignore changing likes, comments, and dates
         normalized = re.sub(r'\d+', '', normalized)
         # Remove common LinkedIn UI noise words that might get caught in innerText
-        noise = ['likes', 'like', 'comments', 'comment', 'reposts', 'repost', 'send', 'share', 'h', 'd', 'w', 'm', 'follow', 'following', 'connect', 'message', 'see', 'more', 'and', 'others', 'reaction']
+        noise = ['likes', 'like', 'comments', 'comment', 'reposts', 'repost', 'send', 'share', 'h', 'd', 'w', 'm']
         for word in noise:
             normalized = re.sub(rf'\b{word}\b', '', normalized)
             
