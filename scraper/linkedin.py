@@ -448,12 +448,27 @@ class LinkedInScraper:
         # --- Post URN ---
         post_urn = await element.get_attribute("data-urn") or ""
         if not post_urn:
-            # Try to find a nested element with data-urn
-            urn_el = await element.query_selector("[data-urn]")
+            post_urn = await element.get_attribute("data-chameleon-result-urn") or ""
+        if not post_urn:
+            post_urn = await element.get_attribute("data-id") or ""
+            
+        if not post_urn:
+            # Try to find a nested element with URN attributes
+            urn_el = await element.query_selector("[data-urn], [data-chameleon-result-urn], [data-id]")
             if urn_el:
-                post_urn = await urn_el.get_attribute("data-urn") or ""
+                post_urn = (
+                    await urn_el.get_attribute("data-urn") or 
+                    await urn_el.get_attribute("data-chameleon-result-urn") or 
+                    await urn_el.get_attribute("data-id") or ""
+                )
 
-        # No fake URN generation — if we can't find one, leave it empty
+        # Normalize URN if it has search prefixes
+        if post_urn and "activity:" in post_urn:
+            # Extract just the activity URN
+            import re
+            match = re.search(r'(urn:li:activity:\d+|urn:li:share:\d+|urn:li:ugcPost:\d+)', post_urn)
+            if match:
+                post_urn = match.group(1)
 
         # --- Author name ---
         author_name = ""
@@ -544,7 +559,9 @@ class LinkedInScraper:
             if post_url:
                 break
 
-        # No fake URL generation — leave empty if not found
+        # Fallback: construct URL from URN if available
+        if not post_url and post_urn:
+            post_url = f"https://www.linkedin.com/feed/update/{post_urn}/"
 
         # --- Author profile / company link (for company_url fallback) ---
         author_url = ""

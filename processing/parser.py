@@ -252,13 +252,37 @@ def is_apply_link(url: str) -> bool:
     return bool(combined.search(url))
 
 
-def determine_primary_url(content: str, urls: list[str]) -> Optional[str]:
+def determine_primary_url(content: str, urls: list[str], role: Optional[str] = None) -> Optional[str]:
     """Determine the most relevant primary URL based on context."""
     if not urls:
         return None
         
     content_lower = content.lower()
-    # Search for strong signals near the URL
+    
+    # Priority 1: Match the URL closest to the extracted Role (if provided)
+    if role:
+        role_lower = role.lower()
+        import re
+        role_indices = [m.start() for m in re.finditer(re.escape(role_lower), content_lower)]
+        if role_indices:
+            best_url = None
+            min_dist = float('inf')
+            for url in urls:
+                url_idx = content_lower.find(url.lower())
+                if url_idx != -1:
+                    # Find closest role mention BEFORE the url
+                    valid_dists = [url_idx - r_idx for r_idx in role_indices if url_idx > r_idx]
+                    if valid_dists:
+                        dist = min(valid_dists)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_url = url
+            
+            # If the best URL is within a reasonable distance (e.g. 200 chars), it's highly likely the correct one
+            if best_url and min_dist < 200:
+                return best_url
+
+    # Priority 2: Search for strong signals near the URL
     anchor_phrases = ["view the jd", "more details", "job description", "apply here", "apply link", "link below", "find out more"]
     
     for url in urls:
@@ -470,7 +494,7 @@ def parse_post(raw: RawPost) -> ParsedPost:
             pass
 
     # Determine primary URL
-    primary_url = determine_primary_url(content, resolved_links)
+    primary_url = determine_primary_url(content, resolved_links, role)
     if primary_url and primary_url in resolved_links:
         resolved_links.remove(primary_url)
         
