@@ -84,6 +84,22 @@ TARGET_LOCATIONS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Location Aliases / Abbreviations
+# ---------------------------------------------------------------------------
+# Maps shorthand a post might use to a canonical location. The canonical value
+# MUST appear in TARGET_LOCATIONS above, so alias matches still pass the filter.
+LOCATION_ALIASES = {
+    "blr": "Bangalore",
+    "bglr": "Bangalore",
+    "hyd": "Hyderabad",
+    "ncr": "Delhi",
+    "new delhi": "Delhi",
+    "ggn": "Gurugram",
+    "wfh": "Remote",
+    "work from home": "Remote",
+}
+
+# ---------------------------------------------------------------------------
 # Experience Filter
 # ---------------------------------------------------------------------------
 # Posts are accepted if the mentioned experience range overlaps with this range.
@@ -98,7 +114,7 @@ USER_SKILLS = [
     "Python",
     "LangChain",
     "RAG",
-    "LangGraph"
+    "LangGraph",
     "Vector Databases",
     "LLM",
     "Generative AI",
@@ -199,6 +215,9 @@ SHORTENED_URL_DOMAINS = [
     "cutt.ly",
     "shorturl.at",
 ]
+
+# Timeout (seconds) for following redirects when resolving a shortened URL.
+URL_RESOLVE_TIMEOUT = 5
 
 # ---------------------------------------------------------------------------
 # Seniority — Titles/keywords to REJECT (too senior)

@@ -101,7 +101,7 @@ class ParsedPost:
 
     @property
     def skills_str(self) -> str:
-        """Newline-separated skills for Telegram."""
+        """Newline-separated skills for display."""
         return "\n".join(f"• {s}" for s in self.skills) if self.skills else "Not Specified"
 
 
@@ -124,8 +124,10 @@ class RunStats:
     started_at: datetime = field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
     keywords_searched: int = 0
-    posts_found: int = 0
-    new_posts: int = 0
+    posts_found: int = 0          # raw posts scraped
+    duplicates_removed: int = 0   # already-seen posts dropped by dedup
+    filtered_out: int = 0         # unseen posts that failed the filters
+    new_posts: int = 0            # posts that passed all filters (relevant)
 
     errors: list[str] = field(default_factory=list)
 
@@ -139,7 +141,9 @@ class RunStats:
         return (
             f"Run completed in {self.duration_seconds:.1f}s | "
             f"Keywords: {self.keywords_searched} | "
-            f"Posts found: {self.posts_found} | "
+            f"Scraped: {self.posts_found} | "
+            f"Duplicates: {self.duplicates_removed} | "
+            f"Filtered out: {self.filtered_out} | "
             f"New: {self.new_posts} | "
             f"Errors: {len(self.errors)}"
         )

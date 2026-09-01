@@ -61,7 +61,6 @@ def setup_logging():
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
 logger = logging.getLogger(__name__)
@@ -85,11 +84,12 @@ async def run_pipeline(dry_run: bool = False, url: str = "",
     5. Filter posts (hiring signal, experience, location, seniority)
     6. Deduplicate against database
     7. Store new posts
-    8. Send Telegram notifications (unless dry_run)
-    9. Log run statistics
+    8. Log run statistics
+
+    (Notifications were removed; posts are surfaced via the dashboard.)
 
     Args:
-        dry_run: If True, scrape & parse but don't send notifications.
+        dry_run: If True, scrape & parse without side effects.
         url: If provided, scrape this URL directly instead of using keywords.
         filter_locations: Optional list of accepted locations (overrides config).
         filter_experience: Optional (min, max) experience range (overrides config).
@@ -147,6 +147,7 @@ async def run_pipeline(dry_run: bool = False, url: str = "",
 
         # --- Step 5: Deduplicate ---
         new_posts = dedup.filter_new_posts(raw_posts)
+        stats.duplicates_removed = len(raw_posts) - len(new_posts)
         # We don't set stats.new_posts here yet, we set it after filtering to reflect only relevant posts.
         logger.info("🆕 New (unseen) posts: %d", len(new_posts))
 
@@ -163,10 +164,14 @@ async def run_pipeline(dry_run: bool = False, url: str = "",
         stats.completed_at = datetime.now()  # temporary, will be overwritten
         current_run_id = db.log_run(stats)
 
-        for raw in new_posts:
-            # Parse
-            parsed = parse_post(raw)
+        # Parse posts concurrently in worker threads. parse_post does blocking
+        # network I/O (resolving shortened URLs), so fanning it out keeps that
+        # off the asyncio event loop and runs the lookups in parallel.
+        parsed_posts = await asyncio.gather(
+            *(asyncio.to_thread(parse_post, raw) for raw in new_posts)
+        )
 
+        for parsed in parsed_posts:
             # Filter (with optional overrides from the dashboard)
             filtered = apply_all_filters(
                 parsed,
@@ -187,8 +192,9 @@ async def run_pipeline(dry_run: bool = False, url: str = "",
             "🔍 Filtered: %d/%d posts passed all filters",
             len(filtered_posts), len(new_posts),
         )
-        
+
         # Set new_posts to the number of filtered posts for the UI
+        stats.filtered_out = len(new_posts) - len(filtered_posts)
         stats.new_posts = len(filtered_posts)
 
         if not filtered_posts:

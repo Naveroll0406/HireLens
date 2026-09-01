@@ -179,8 +179,8 @@ class LinkedInScraper:
 
         # Scroll and extract in chunks to prevent LinkedIn from unmounting older posts from the virtual DOM
         all_posts = []
-        seen_texts = set()
-        
+        seen_hashes = set()
+
         scrolls_remaining = config.SCROLL_COUNT
         while scrolls_remaining > 0:
             chunk = min(3, scrolls_remaining)
@@ -191,12 +191,17 @@ class LinkedInScraper:
                 max_delay=config.SCROLL_DELAY_MAX,
             )
             scrolls_remaining -= chunk
-            
+
             current_posts = await self._extract_posts(keyword)
             for p in current_posts:
-                if p.content and p.content not in seen_texts:
+                if not p.content:
+                    continue
+                # Use the normalized content hash (strips counts/noise) so a
+                # post captured again after "…more" expansion isn't duplicated.
+                h = p.content_hash
+                if h not in seen_hashes:
                     all_posts.append(p)
-                    seen_texts.add(p.content)
+                    seen_hashes.add(h)
 
         logger.info(
             "Found %d posts for '%s'.",
@@ -277,8 +282,8 @@ class LinkedInScraper:
         start_time = time.time()
         
         all_posts = []
-        seen_texts = set()
-        
+        seen_hashes = set()
+
         while time.time() - start_time < scroll_duration:
             # Scroll a few times (roughly 3-6 seconds)
             await human_scroll(
@@ -287,15 +292,19 @@ class LinkedInScraper:
                 min_delay=config.SCROLL_DELAY_MIN,
                 max_delay=config.SCROLL_DELAY_MAX,
             )
-            
+
             # Extract currently visible posts before LinkedIn unmounts them
             current_posts = await self._extract_posts(keyword_tag, limit=1000)
-            
-            # Deduplicate chunks locally
+
+            # Deduplicate chunks locally using the normalized content hash so an
+            # expanded ("…more") re-capture of the same post isn't counted twice.
             for p in current_posts:
-                if p.content and p.content not in seen_texts:
+                if not p.content:
+                    continue
+                h = p.content_hash
+                if h not in seen_hashes:
                     all_posts.append(p)
-                    seen_texts.add(p.content)
+                    seen_hashes.add(h)
                     
             elapsed = int(time.time() - start_time)
             logger.info("Scrolling... %ds elapsed of %ds. Captured %d posts so far.", elapsed, scroll_duration, len(all_posts))
@@ -329,6 +338,7 @@ class LinkedInScraper:
                     "Waiting %.0fs before next search... (%d/%d keywords done)",
                     delay, i + 1, len(keywords),
                 )
+                await asyncio.sleep(delay)
 
         logger.info(
             "Total: %d raw posts from %d keyword searches.",
@@ -839,9 +849,14 @@ class LinkedInScraper:
     # ------------------------------------------------------------------
 
     async def _inter_search_delay(self) -> float:
-        """Wait a random delay between keyword searches."""
+        """Compute a random delay (seconds) to wait between keyword searches.
+
+        Reads the max delay from the database (dashboard-configurable), falling
+        back to config. Does NOT sleep — the caller logs the value and then
+        awaits it, so the "Waiting Xs" message appears before the wait.
+        """
         import random
-        
+
         # Read max delay from database
         try:
             from storage.database import Database
@@ -853,12 +868,10 @@ class LinkedInScraper:
         except Exception as e:
             logger.debug("Failed to read search_delay_max from DB: %s", e)
             max_delay = config.SEARCH_DELAY_MAX
-            
+
         min_delay = max(5.0, max_delay - 15.0)  # Keep min somewhat reasonable
-        
-        delay = random.uniform(min_delay, max_delay)
-        await asyncio.sleep(delay)
-        return delay
+
+        return random.uniform(min_delay, max_delay)
 
     async def take_screenshot(self, name: str = "debug"):
         """Save a screenshot for debugging."""

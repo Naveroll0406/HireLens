@@ -69,6 +69,18 @@ st.markdown("""
     /* Global */
     .stApp {
         font-family: 'Inter', sans-serif !important;
+        background:
+            radial-gradient(1100px 600px at 12% -8%, rgba(79, 140, 255, 0.14), transparent 60%),
+            radial-gradient(900px 550px at 92% 4%, rgba(168, 85, 247, 0.13), transparent 58%),
+            radial-gradient(800px 700px at 50% 108%, rgba(6, 182, 212, 0.10), transparent 60%),
+            var(--bg-primary) !important;
+        background-attachment: fixed !important;
+    }
+
+    /* Constrain and center the main content for a calmer layout */
+    .block-container {
+        max-width: 1300px;
+        padding-top: 2rem !important;
     }
 
     /* ===== FORCE SIDEBAR ALWAYS VISIBLE ===== */
@@ -445,6 +457,96 @@ st.markdown("""
     ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
 
+    /* ===== Tabs ===== */
+    div[data-testid="stTabs"] div[role="tablist"] {
+        gap: 0.4rem;
+        border-bottom: 1px solid var(--border-glass) !important;
+        padding-bottom: 0.2rem;
+    }
+    div[data-testid="stTabs"] button[role="tab"] {
+        background: var(--bg-glass) !important;
+        border: 1px solid var(--border-glass) !important;
+        border-radius: 12px 12px 0 0 !important;
+        padding: 0.55rem 1.1rem !important;
+        color: var(--text-secondary) !important;
+        font-weight: 600 !important;
+        transition: all 0.25s ease !important;
+    }
+    div[data-testid="stTabs"] button[role="tab"]:hover {
+        color: var(--text-primary) !important;
+        border-color: rgba(79, 140, 255, 0.35) !important;
+    }
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+        color: var(--text-primary) !important;
+        background: linear-gradient(135deg, rgba(79,140,255,0.18), rgba(168,85,247,0.18)) !important;
+        border-color: rgba(79,140,255,0.4) !important;
+        box-shadow: 0 -2px 16px rgba(79,140,255,0.12);
+    }
+    div[data-testid="stTabs"] div[role="tablist"] [data-baseweb="tab-highlight"],
+    div[data-testid="stTabs"] div[role="tablist"] [data-baseweb="tab-border"] {
+        background: transparent !important;
+    }
+
+    /* ===== Primary button — gradient ===== */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)) !important;
+        border: none !important;
+        color: #fff !important;
+        box-shadow: 0 4px 18px rgba(79,140,255,0.28) !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        filter: brightness(1.08);
+        box-shadow: 0 6px 24px rgba(79,140,255,0.4) !important;
+    }
+
+    /* ===== Metric cards (st.metric) ===== */
+    div[data-testid="stMetric"] {
+        background: var(--bg-glass);
+        border: 1px solid var(--border-glass);
+        border-radius: 14px;
+        padding: 1rem 1.1rem;
+        backdrop-filter: blur(12px);
+        transition: all 0.3s ease;
+    }
+    div[data-testid="stMetric"]:hover {
+        border-color: rgba(79,140,255,0.3);
+        transform: translateY(-2px);
+        box-shadow: 0 8px 28px rgba(79,140,255,0.1);
+    }
+    div[data-testid="stMetricValue"] {
+        font-weight: 800 !important;
+        letter-spacing: -0.02em;
+    }
+
+    /* ===== Inputs ===== */
+    .stTextInput input, .stNumberInput input, div[data-baseweb="select"] > div {
+        background: var(--bg-glass) !important;
+        border: 1px solid var(--border-glass) !important;
+        border-radius: 10px !important;
+        color: var(--text-primary) !important;
+    }
+    .stTextInput input:focus, .stNumberInput input:focus {
+        border-color: rgba(79,140,255,0.5) !important;
+        box-shadow: 0 0 0 2px rgba(79,140,255,0.15) !important;
+    }
+
+    /* ===== Run log entry — richer ===== */
+    .run-log-entry {
+        transition: all 0.25s ease;
+    }
+    .run-log-entry:hover {
+        border-color: rgba(79,140,255,0.3);
+        transform: translateX(2px);
+        background: rgba(79,140,255,0.05);
+    }
+    .run-log-entry span {
+        color: var(--text-secondary);
+        font-weight: 500;
+    }
+
+    /* Section headings a touch tighter */
+    h3 { letter-spacing: -0.01em; }
+
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -755,8 +857,9 @@ def run_scraper_in_background(url: str = "",
 
             st.session_state["scraper_last_stats"] = {
                 "posts_found": stats.posts_found,
+                "duplicates_removed": stats.duplicates_removed,
+                "filtered_out": stats.filtered_out,
                 "new_posts": stats.new_posts,
-                "notifications_sent": stats.notifications_sent,
                 "duration": stats.duration_seconds,
                 "errors": stats.errors,
                 "url_used": url,
@@ -764,8 +867,9 @@ def run_scraper_in_background(url: str = "",
         except Exception as e:
             st.session_state["scraper_last_stats"] = {
                 "posts_found": 0,
+                "duplicates_removed": 0,
+                "filtered_out": 0,
                 "new_posts": 0,
-                "notifications_sent": 0,
                 "duration": 0,
                 "errors": [str(e)],
                 "url_used": url,
@@ -845,13 +949,20 @@ def render_url_input():
     # Last run results
     last_stats = st.session_state.get("scraper_last_stats")
     if last_stats and not is_running:
-        cols = st.columns(3)
+        cols = st.columns(5)
         with cols[0]:
-            st.metric("📄 Posts Found", last_stats["posts_found"])
+            st.metric("📄 Scraped", last_stats.get("posts_found", 0))
         with cols[1]:
-            st.metric("🆕 New Posts", last_stats["new_posts"])
+            st.metric("♻️ Duplicates", last_stats.get("duplicates_removed", 0),
+                      help="Already-seen posts skipped by deduplication")
         with cols[2]:
-            st.metric("⏱ Duration", f"{last_stats['duration']:.0f}s")
+            st.metric("🚫 Filtered Out", last_stats.get("filtered_out", 0),
+                      help="New posts that did not pass the AI/location/experience filters")
+        with cols[3]:
+            st.metric("🆕 New", last_stats.get("new_posts", 0),
+                      help="Relevant posts that passed all filters")
+        with cols[4]:
+            st.metric("⏱ Duration", f"{last_stats.get('duration', 0):.0f}s")
         if last_stats.get("errors"):
             for err in last_stats["errors"][:3]:
                 st.error(f"❌ {err[:150]}")
@@ -1289,10 +1400,21 @@ def render_run_history():
         st.info("No run history yet. Run the scraper to see history here.")
         return
 
+    def _num(row, col):
+        val = row.get(col, 0)
+        try:
+            if pd.isna(val):
+                return 0
+        except (TypeError, ValueError):
+            pass
+        return int(val or 0)
+
     for _, row in df.iterrows():
         started = row.get("started_at", "N/A")
-        posts = row.get("posts_found", 0)
-        new = row.get("new_posts", 0)
+        posts = _num(row, "posts_found")
+        dupes = _num(row, "duplicates_removed")
+        filtered = _num(row, "filtered_out")
+        new = _num(row, "new_posts")
         errors = row.get("errors", "")
 
         error_badge = ""
@@ -1302,7 +1424,9 @@ def render_run_history():
         st.markdown(f"""
         <div class="run-log-entry">
             <span>🕐 {started}</span>
-            <span>📄 {posts} found</span>
+            <span>📄 {posts} scraped</span>
+            <span>♻️ {dupes} dupes</span>
+            <span>🚫 {filtered} filtered</span>
             <span>🆕 {new} new</span>
             <span>{error_badge}</span>
         </div>
@@ -1468,7 +1592,27 @@ def main():
         run_df = load_run_logs(50)
         if not run_df.empty:
             st.markdown("### 📊 Detailed Log")
-            st.dataframe(run_df, use_container_width=True, hide_index=True)
+            log_cols = [
+                "started_at", "completed_at", "keywords_searched",
+                "posts_found", "duplicates_removed", "filtered_out",
+                "new_posts", "errors",
+            ]
+            available = [c for c in log_cols if c in run_df.columns]
+            st.dataframe(
+                run_df[available],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "started_at": st.column_config.TextColumn("Started"),
+                    "completed_at": st.column_config.TextColumn("Completed"),
+                    "keywords_searched": st.column_config.NumberColumn("Keywords"),
+                    "posts_found": st.column_config.NumberColumn("Scraped"),
+                    "duplicates_removed": st.column_config.NumberColumn("Duplicates"),
+                    "filtered_out": st.column_config.NumberColumn("Filtered Out"),
+                    "new_posts": st.column_config.NumberColumn("New"),
+                    "errors": st.column_config.TextColumn("Errors", width="medium"),
+                },
+            )
 
 
 if __name__ == "__main__":

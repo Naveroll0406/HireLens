@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -41,7 +42,7 @@ ROLE_PATTERNS = [
 EXPERIENCE_PATTERNS = [
     # "2-4 years" / "2 to 4 years" / "2 - 4 yrs" / "0.5 - 2 years"
     re.compile(
-        r"(\d{1,2}(?:\.\d+)?)\s*[-–to]+\s*(\d{1,2}(?:\.\d+)?)\s*(?:\+\s*)?(?:years?|yrs?|y)\b",
+        r"(\d{1,2}(?:\.\d+)?)\s*(?:-|–|to)\s*(\d{1,2}(?:\.\d+)?)\s*(?:\+\s*)?(?:years?|yrs?|y)\b",
         re.IGNORECASE,
     ),
     # "2+ years" / "3+ yrs" / "1.5+ years"
@@ -61,7 +62,7 @@ EXPERIENCE_PATTERNS = [
     ),
     # "experience: 2-4 years"
     re.compile(
-        r"experience\s*[:]\s*(\d{1,2}(?:\.\d+)?)\s*[-–to]+\s*(\d{1,2}(?:\.\d+)?)",
+        r"experience\s*[:]\s*(\d{1,2}(?:\.\d+)?)\s*(?:-|–|to)\s*(\d{1,2}(?:\.\d+)?)",
         re.IGNORECASE,
     ),
 ]
@@ -172,6 +173,12 @@ def extract_locations(text: str) -> list[str]:
             # Use the canonical form from config
             if location not in found:
                 found.append(location)
+
+    # Also match shorthand/abbreviations, mapping them to their canonical form.
+    for alias, canonical in getattr(config, "LOCATION_ALIASES", {}).items():
+        pattern = re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE)
+        if pattern.search(text) and canonical not in found:
+            found.append(canonical)
 
     return found
 
@@ -307,12 +314,34 @@ def determine_primary_url(content: str, urls: list[str], role: Optional[str] = N
     # Fallback 2: Just return the first one
     return urls[0]
 
-def resolve_shortened_url(url: str, timeout: int = 5) -> str:
+# Process-wide cache so the same shortener is only fetched once per run (and
+# across runs within the same process). Guarded by a lock because parsing is
+# fanned out across worker threads from the async pipeline.
+_URL_RESOLVE_CACHE: dict[str, str] = {}
+_URL_RESOLVE_LOCK = threading.Lock()
+
+
+def resolve_shortened_url(url: str, timeout: int | None = None) -> str:
     """Follow redirects on shortened URLs and return the final destination.
 
     Only resolves URLs from known shortener domains (config.SHORTENED_URL_DOMAINS).
     Returns the original URL if resolution fails or the domain isn't a shortener.
+
+    Results are memoized in a thread-safe process-wide cache, so repeated
+    shorteners (very common in a scrape) cost only one network round-trip.
+    This is a blocking network call — the pipeline resolves posts in worker
+    threads (see main.py) so it never stalls the asyncio event loop.
     """
+    if timeout is None:
+        timeout = getattr(config, "URL_RESOLVE_TIMEOUT", 5)
+
+    # Fast path: already resolved this URL.
+    with _URL_RESOLVE_LOCK:
+        cached = _URL_RESOLVE_CACHE.get(url)
+    if cached is not None:
+        return cached
+
+    resolved = url
     try:
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
@@ -322,6 +351,8 @@ def resolve_shortened_url(url: str, timeout: int = 5) -> str:
 
         # Only resolve known shortener domains
         if not any(domain == sd or domain.endswith("." + sd) for sd in config.SHORTENED_URL_DOMAINS):
+            with _URL_RESOLVE_LOCK:
+                _URL_RESOLVE_CACHE[url] = url
             return url
 
         logger.debug("Resolving shortened URL: %s", url)
@@ -331,11 +362,13 @@ def resolve_shortened_url(url: str, timeout: int = 5) -> str:
             final_url = resp.url
             if final_url and final_url != url:
                 logger.debug("Resolved %s → %s", url[:50], final_url[:80])
-                return final_url
+                resolved = final_url
     except Exception as e:
         logger.debug("Failed to resolve %s: %s", url[:50], e)
 
-    return url
+    with _URL_RESOLVE_LOCK:
+        _URL_RESOLVE_CACHE[url] = resolved
+    return resolved
 
 
 def extract_company_url(text: str) -> Optional[str]:

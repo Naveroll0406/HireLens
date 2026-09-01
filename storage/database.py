@@ -126,6 +126,8 @@ class Database:
             "ALTER TABLE posts ADD COLUMN run_id INTEGER;",
             "ALTER TABLE posts ADD COLUMN company_url TEXT;",
             "ALTER TABLE posts ADD COLUMN author_url TEXT;",
+            "ALTER TABLE run_log ADD COLUMN duplicates_removed INTEGER DEFAULT 0;",
+            "ALTER TABLE run_log ADD COLUMN filtered_out INTEGER DEFAULT 0;",
         ]:
             try:
                 self.conn.execute(col_sql)
@@ -270,14 +272,16 @@ class Database:
             """
             INSERT INTO run_log
                 (started_at, completed_at, keywords_searched,
-                 posts_found, new_posts, errors)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 posts_found, duplicates_removed, filtered_out, new_posts, errors)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 stats.started_at.isoformat(),
                 stats.completed_at.isoformat() if stats.completed_at else None,
                 stats.keywords_searched,
                 stats.posts_found,
+                stats.duplicates_removed,
+                stats.filtered_out,
                 stats.new_posts,
                 json.dumps(stats.errors) if stats.errors else None,
             ),
