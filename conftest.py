@@ -71,3 +71,20 @@ def make_raw():
 @pytest.fixture
 def make_parsed():
     return _make_parsed
+
+
+@pytest.fixture(autouse=True)
+def _no_live_llm(monkeypatch):
+    """Keep the suite hermetic.
+
+    A real GEMINI_API_KEY in the developer's .env would otherwise make the
+    pipeline tests call Gemini for every run: slow, billable, and it changes
+    the scores the rule-engine assertions are written against. Tests that
+    want the LLM path mock `classify_texts` and set `find_api_key` themselves,
+    which still works because this only clears the default lookup.
+    """
+    from processing import llm_scoring
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(llm_scoring, "find_api_key", lambda: None)

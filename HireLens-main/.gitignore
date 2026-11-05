@@ -1,0 +1,22 @@
+# Environment and Secrets
+.env
+.venv/
+venv/
+env/
+
+# Caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Database and Scraped Data
+data/
+logs/
+*.db
+*.sqlite3
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store

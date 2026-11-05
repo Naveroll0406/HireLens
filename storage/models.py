@@ -8,9 +8,22 @@ These are used throughout the pipeline to pass structured data between stages.
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+
+# Lines LinkedIn's innerText adds around a post that are not part of the
+# content: reaction counts, "…more", "Like / Comment / Repost" toolbars.
+_UI_NOISE_LINE = re.compile(
+    r"^\s*(?:\d[\d,.]*\s*(?:k|m)?\s*)?"
+    r"(?:likes?|comments?|reposts?|reactions?|send|share|follow|"
+    r"…\s*more|\.\.\.\s*more|see more|show more|"
+    r"like\s+comment\s+(?:repost|share)\s+send)\s*$",
+    re.IGNORECASE,
+)
+_RELATIVE_TIME_LINE = re.compile(r"^\s*\d+\s*(?:h|d|w|mo|m|y|hr|hrs|min|mins)\b.*$", re.IGNORECASE)
 
 
 @dataclass
@@ -27,34 +40,44 @@ class RawPost:
     keyword_matched: str  # Which search keyword found this post
     extracted_urls: list[str] = field(default_factory=list)  # ALL URLs scraped from <a> tags and embedded cards
     scraped_at: datetime = field(default_factory=datetime.now)
+    posted_at: Optional[datetime] = None  # Absolute post time derived from timestamp_text at scrape time
 
     @property
     def clean_content(self) -> str:
         """Returns the content with fancy Unicode formatting normalized to standard ASCII."""
-        import unicodedata
         if not self.content:
             return ""
         return unicodedata.normalize('NFKD', self.content)
 
     @property
+    def normalized_content(self) -> str:
+        """Content with LinkedIn UI chrome stripped, lower-cased, whitespace-collapsed.
+
+        Only whole noise *lines* (reaction counts, toolbars, relative timestamps)
+        are removed — digits inside the body ("2-4 years", "5 LPA") are kept so
+        two different postings from the same recruiter stay distinct.
+        """
+        lines = []
+        for line in self.clean_content.splitlines():
+            if not line.strip():
+                continue
+            if _UI_NOISE_LINE.match(line) or _RELATIVE_TIME_LINE.match(line):
+                continue
+            lines.append(line)
+        return " ".join(" ".join(lines).lower().split())
+
+    @property
     def content_hash(self) -> str:
-        """SHA-256 hash of normalized content for deduplication."""
-        import re
-        normalized = self.clean_content.lower().strip()
-        # Remove all numbers to ignore changing likes, comments, and dates
-        normalized = re.sub(r'\d+', '', normalized)
-        # Remove common LinkedIn UI noise words that might get caught in innerText
-        noise = ['likes', 'like', 'comments', 'comment', 'reposts', 'repost', 'send', 'share', 'h', 'd', 'w', 'm']
-        for word in noise:
-            normalized = re.sub(rf'\b{word}\b', '', normalized)
-            
-        author = re.sub(r'[^a-z]', '', self.author_name.lower().strip())
-        
-        # Remove extra whitespace and take first 200 chars to avoid trailing dynamic content
-        normalized = " ".join(normalized.split())[:200]
-        
-        core_text = f"{author}_{normalized}"
+        """SHA-256 of (author, normalized content) for exact-duplicate detection."""
+        author = re.sub(r"[^a-z]", "", self.author_name.lower().strip())
+        core_text = f"{author}_{self.normalized_content}"
         return hashlib.sha256(core_text.encode("utf-8")).hexdigest()
+
+    @property
+    def simhash(self) -> int:
+        """64-bit SimHash fingerprint for near-duplicate detection across authors."""
+        from processing.simhash import simhash
+        return simhash(self.normalized_content)
 
 
 @dataclass
@@ -83,6 +106,16 @@ class ParsedPost:
     # Seniority flag
     is_senior_role: bool = False
 
+    # Relevance scoring (filled in by processing.scoring)
+    relevance_score: int = 0
+    score_breakdown: dict[str, int] = field(default_factory=dict)
+    filter_reason: str = ""
+
+    # The rule engine's own score, kept even when an LLM overrides
+    # relevance_score, so the two can be compared in the dashboard.
+    rule_score: int = 0
+    scored_by: str = "rules"   # "rules" | "gemini"
+
     @property
     def experience_str(self) -> str:
         """Human-readable experience string."""
@@ -107,11 +140,11 @@ class ParsedPost:
 
 @dataclass
 class FilteredPost:
-    """Post that has passed all filters and is ready for notification."""
+    """Post that scored at or above the relevance threshold."""
 
     parsed: ParsedPost
-    relevance_score: int = 0  # 0-100, used in V2 with LLM scoring
-    filter_reason: str = ""  # Why it passed / what matched
+    relevance_score: int = 0  # 0-100
+    filter_reason: str = ""  # Human-readable summary of the score breakdown
 
 
 
@@ -128,8 +161,20 @@ class RunStats:
     duplicates_removed: int = 0   # already-seen posts dropped by dedup
     filtered_out: int = 0         # unseen posts that failed the filters
     new_posts: int = 0            # posts that passed all filters (relevant)
+    notified: int = 0             # posts pushed to Telegram
+    blocked: bool = False         # LinkedIn challenged / blocked the session
+    deep_scan: bool = False       # this run used the long lookback window
+    scored_by: str = "rules"      # which engine scored this run's posts
 
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        if self.blocked:
+            return "blocked"
+        if self.errors:
+            return "error"
+        return "ok"
 
     @property
     def duration_seconds(self) -> float:
@@ -145,5 +190,6 @@ class RunStats:
             f"Duplicates: {self.duplicates_removed} | "
             f"Filtered out: {self.filtered_out} | "
             f"New: {self.new_posts} | "
-            f"Errors: {len(self.errors)}"
+            f"Notified: {self.notified} | "
+            f"Status: {self.status}"
         )

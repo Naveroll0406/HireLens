@@ -1,0 +1,49 @@
+[project]
+name = "hirelens"
+version = "0.2.0"
+description = "Rule-based LinkedIn hiring-post monitor for AI/GenAI/LLM roles (no LLM required)."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning:streamlit.*",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["data", "logs", ".pytest_cache", "HireLens-main"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+]
+ignore = [
+    "E501",   # line length (handled loosely; dashboard has long HTML strings)
+    "B008",   # function calls in defaults (Streamlit idiom)
+    "SIM108", # ternary suggestions hurt readability in parsers
+    "UP035",  # keep typing.Optional in signatures for readability
+    "UP007",  # keep Optional[...] style used throughout
+    "UP045",  # same - Optional[X] rather than X | None
+    "B905",   # zip(strict=) not needed on 3.10-compatible code
+    "SIM105", # explicit try/except/pass is clearer than contextlib.suppress here
+    "SIM102", # nested ifs are often clearer in the parsers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]        # sys.path shim before imports
+"main.py" = ["E402"]
+"scheduler.py" = ["E402"]
+"dashboard.py" = ["E402", "E701", "E702"]  # sys.path shim, compact one-liners in HTML builders
+"conftest.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "processing", "scraper", "storage", "notifications"]

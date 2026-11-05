@@ -1,0 +1,17 @@
+# HireLens — native Streamlit widgets are themed to match the custom CSS layer
+# in ui/theme.py.  Without this, selects / sliders / expanders render in the
+# default light theme and clash with the dark surface.
+
+[theme]
+base = "dark"
+primaryColor = "#6d8cff"
+backgroundColor = "#07070f"
+secondaryBackgroundColor = "#101024"
+textColor = "#eef1f8"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

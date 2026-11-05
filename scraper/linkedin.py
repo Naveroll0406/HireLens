@@ -9,26 +9,41 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
+import random
+import time
 import urllib.parse
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 import config
+from processing.parser import (
+    parse_relative_timestamp,
+    resolve_author_headline,
+    resolve_author_name,
+)
 from scraper.stealth import (
     apply_stealth_scripts,
     get_launch_args,
-    get_random_user_agent,
     get_random_viewport,
     human_scroll,
-    human_scroll_for_duration,
     random_delay,
 )
+from storage.database import Database
 from storage.models import RawPost
 
 logger = logging.getLogger(__name__)
+
+
+class BlockedError(RuntimeError):
+    """LinkedIn served a checkpoint / challenge / restriction page.
+
+    Raised instead of returning an empty list so the pipeline can stop the
+    run immediately, mark it 'blocked', and let the scheduler back off.
+    """
 
 
 class LinkedInScraper:
@@ -51,7 +66,6 @@ class LinkedInScraper:
         self._playwright = await async_playwright().start()
 
         viewport = get_random_viewport()
-        user_agent = get_random_user_agent()
 
         logger.info(
             "Launching browser (viewport: %dx%d, profile: %s)",
@@ -64,7 +78,6 @@ class LinkedInScraper:
             headless=False,  # LinkedIn detects headless browsers aggressively
             args=get_launch_args(),
             viewport=viewport,
-            user_agent=user_agent,
             locale="en-US",
             timezone_id="Asia/Kolkata",
             ignore_https_errors=True,
@@ -89,6 +102,37 @@ class LinkedInScraper:
         if self._playwright:
             await self._playwright.stop()
         logger.info("Browser closed.")
+
+    # ------------------------------------------------------------------
+    # Block / challenge detection
+    # ------------------------------------------------------------------
+
+    async def _check_blocked(self, where: str = "") -> None:
+        """Raise BlockedError if the current page is a LinkedIn challenge/restriction.
+
+        Login redirects are handled separately by ensure_logged_in(); here a
+        /login or /authwall mid-run means the session was invalidated.
+        """
+        url = self._page.url or ""
+        if any(marker in url for marker in config.BLOCK_URL_MARKERS):
+            await self._screenshot_quietly("blocked")
+            raise BlockedError(f"LinkedIn redirected to {url[:80]} {where}".strip())
+
+        try:
+            body = (await self._page.inner_text("body"))[:5000].lower()
+        except Exception:
+            return
+        for marker in config.BLOCK_PAGE_MARKERS:
+            if marker in body:
+                await self._screenshot_quietly("blocked")
+                raise BlockedError(f"LinkedIn challenge page ('{marker}') {where}".strip())
+
+    async def _screenshot_quietly(self, name: str) -> None:
+        """Best-effort debug screenshot; never lets a screenshot failure hide the real error."""
+        try:
+            await self.take_screenshot(name)
+        except Exception as e:
+            logger.debug("Screenshot failed: %s", e)
 
     # ------------------------------------------------------------------
     # Login check
@@ -142,39 +186,61 @@ class LinkedInScraper:
     # Search
     # ------------------------------------------------------------------
 
-    async def search_keyword(self, keyword: str) -> list[RawPost]:
-        """Search LinkedIn Posts for a single keyword and extract results.
-
-        Returns a list of RawPost objects.
-        """
-        search_url = config.LINKEDIN_SEARCH_URL_TEMPLATE.format(
-            keyword=urllib.parse.quote(keyword)
+    def build_search_url(self, keyword: str, window_seconds: int | None = None) -> str:
+        if window_seconds is None:
+            window_seconds = config.SEARCH_WINDOW_SECONDS
+        return config.LINKEDIN_SEARCH_URL_TEMPLATE.format(
+            keyword=urllib.parse.quote(keyword),
+            window_seconds=int(window_seconds),
         )
+
+    async def search_keyword(self, keyword: str, window_seconds: int | None = None) -> list[RawPost]:
+        """Search LinkedIn Posts for one keyword, retrying transient failures.
+
+        Timeouts and empty DOMs are retried with exponential backoff
+        (config.SEARCH_MAX_RETRIES). A BlockedError is never retried.
+        """
+        delay = config.SEARCH_RETRY_BACKOFF_SECONDS
+        last_error: Optional[Exception] = None
+        for attempt in range(1, config.SEARCH_MAX_RETRIES + 1):
+            try:
+                return await self._search_keyword_once(keyword, window_seconds)
+            except BlockedError:
+                raise
+            except Exception as e:  # navigation timeout, detached frame, etc.
+                last_error = e
+                if attempt == config.SEARCH_MAX_RETRIES:
+                    break
+                jitter = random.uniform(0.8, 1.3)
+                logger.warning(
+                    "Search '%s' failed (attempt %d/%d): %s — retrying in %.0fs",
+                    keyword, attempt, config.SEARCH_MAX_RETRIES, e, delay * jitter,
+                )
+                await asyncio.sleep(delay * jitter)
+                delay *= 2
+        logger.error("Search '%s' failed after %d attempts: %s", keyword, config.SEARCH_MAX_RETRIES, last_error)
+        return []
+
+    async def _search_keyword_once(self, keyword: str, window_seconds: int | None = None) -> list[RawPost]:
+        search_url = self.build_search_url(keyword, window_seconds)
 
         logger.info("Searching: '%s'", keyword)
         logger.debug("URL: %s", search_url)
 
-        try:
-            await self._page.goto(
-                search_url,
-                wait_until="domcontentloaded",
-                timeout=config.PAGE_TIMEOUT,
-            )
-        except Exception as e:
-            logger.error("Failed to load search page for '%s': %s", keyword, e)
-            return []
+        await self._page.goto(
+            search_url,
+            wait_until="domcontentloaded",
+            timeout=config.PAGE_TIMEOUT,
+        )
 
         # Wait for content to appear
         await random_delay(3, 6)
 
-        # Check for "no results" or login wall
+        await self._check_blocked(f"while searching '{keyword}'")
+
         page_content = await self._page.content()
         if "No results found" in page_content:
             logger.info("No results for '%s'.", keyword)
-            return []
-
-        if "/login" in self._page.url or "/authwall" in self._page.url:
-            logger.error("Redirected to login page. Session may have expired.")
             return []
 
         # Scroll and extract in chunks to prevent LinkedIn from unmounting older posts from the virtual DOM
@@ -219,9 +285,7 @@ class LinkedInScraper:
         # Extract keyword from URL for tagging
         keyword_tag = "direct_url"
         try:
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query)
+            qs = parse_qs(urlparse(url).query)
             if "keywords" in qs:
                 keyword_tag = qs["keywords"][0]
         except Exception:
@@ -241,20 +305,17 @@ class LinkedInScraper:
 
         # Wait for content to appear
         await random_delay(5, 8)
-        
+
         # Try to wait for any post-like container (don't fail if timeout)
         try:
             await self._page.wait_for_selector(
-                "li.reusable-search__result-container, div.feed-shared-update-v2", 
+                "li.reusable-search__result-container, div.feed-shared-update-v2",
                 timeout=5000
             )
         except Exception:
             pass
 
-        # Check for login wall
-        if "/login" in self._page.url or "/authwall" in self._page.url:
-            logger.error("Redirected to login page. Session may have expired.")
-            return []
+        await self._check_blocked("on direct URL")
 
         # Check for "no results"
         page_content = await self._page.content()
@@ -265,7 +326,6 @@ class LinkedInScraper:
         # Read scroll duration from database settings (configurable from dashboard)
         scroll_duration = 300  # default
         try:
-            from storage.database import Database
             db = Database(config.DATABASE_PATH)
             db.init_db()
             db_duration = db.get_setting("scroll_duration_seconds", "")
@@ -277,10 +337,9 @@ class LinkedInScraper:
 
         # Scroll and extract continuously to prevent virtual DOM unmounting
         logger.info("Starting %d-second continuous scroll and extract down the posts feed...", scroll_duration)
-        
-        import time
+
         start_time = time.time()
-        
+
         all_posts = []
         seen_hashes = set()
 
@@ -305,7 +364,7 @@ class LinkedInScraper:
                 if h not in seen_hashes:
                     all_posts.append(p)
                     seen_hashes.add(h)
-                    
+
             elapsed = int(time.time() - start_time)
             logger.info("Scrolling... %ds elapsed of %ds. Captured %d posts so far.", elapsed, scroll_duration, len(all_posts))
 
@@ -316,18 +375,21 @@ class LinkedInScraper:
         logger.info("Found %d posts from direct URL.", len(all_posts))
         return all_posts
 
-    async def search_all_keywords(self, keywords: list[str]) -> list[RawPost]:
+    async def search_all_keywords(self, keywords: list[str],
+                                  window_seconds: int | None = None) -> list[RawPost]:
         """Search for all keywords with delays between searches.
 
         Returns combined list of all RawPosts (may contain cross-keyword duplicates,
-        which the dedup module will handle).
+        which the dedup module will handle). A BlockedError aborts the whole run.
         """
         all_posts: list[RawPost] = []
 
         for i, keyword in enumerate(keywords):
             try:
-                posts = await self.search_keyword(keyword)
+                posts = await self.search_keyword(keyword, window_seconds=window_seconds)
                 all_posts.extend(posts)
+            except BlockedError:
+                raise
             except Exception as e:
                 logger.error("Error searching '%s': %s", keyword, e)
 
@@ -363,7 +425,7 @@ class LinkedInScraper:
                         const classList = (el.className || '').toString().toLowerCase();
                         // Use textContent instead of innerText to prevent massive layout recalculation lag
                         const text = (el.textContent || '').trim().toLowerCase();
-                        
+
                         if (
                             text === 'more' || text === '...more' || text === '…more' || text === '... more' ||
                             text === 'see more' || text === '…see more' || text === '...see more' ||
@@ -392,7 +454,7 @@ class LinkedInScraper:
                 const boxes = document.querySelectorAll('[data-testid="expandable-text-box"], [componentkey*="feed-commentary"], .update-components-text');
                 for (const box of boxes) {
                     let container = box.closest('li.reusable-search__result-container, div[data-urn], div[data-chameleon-result-urn], div.feed-shared-update-v2, div.occludable-update, li[class*="search__result"], li');
-                    
+
                     if (!container) {
                         let parent = box.parentElement;
                         for(let i=0; i<6; i++) {
@@ -404,7 +466,7 @@ class LinkedInScraper:
                             parent = parent.parentElement;
                         }
                     }
-                    
+
                     if (container && container.tagName !== 'BODY' && container.tagName !== 'MAIN' && !container.id.includes('global-nav')) {
                         container.classList.add('hirelens-post-container');
                     }
@@ -461,14 +523,14 @@ class LinkedInScraper:
             post_urn = await element.get_attribute("data-chameleon-result-urn") or ""
         if not post_urn:
             post_urn = await element.get_attribute("data-id") or ""
-            
+
         if not post_urn:
             # Try to find a nested element with URN attributes
             urn_el = await element.query_selector("[data-urn], [data-chameleon-result-urn], [data-id]")
             if urn_el:
                 post_urn = (
-                    await urn_el.get_attribute("data-urn") or 
-                    await urn_el.get_attribute("data-chameleon-result-urn") or 
+                    await urn_el.get_attribute("data-urn") or
+                    await urn_el.get_attribute("data-chameleon-result-urn") or
                     await urn_el.get_attribute("data-id") or ""
                 )
 
@@ -605,7 +667,7 @@ class LinkedInScraper:
                             href = f"https://www.linkedin.com{href}"
                         author_url = href
                         break
-            except Exception as e:
+            except Exception:
                 pass
 
         # --- Extracted URLs from <a> elements ---
@@ -653,6 +715,13 @@ class LinkedInScraper:
                 if timestamp_text:
                     break
 
+        # LinkedIn scrambles its class names, so the selectors above go stale
+        # and silently yield "".  Recover the name from the post structure or
+        # the profile URL rather than storing an anonymous post.
+        author_name = resolve_author_name(author_name, content, author_url)
+        author_headline = resolve_author_headline(author_headline, content, author_name)
+
+        scraped_at = datetime.now()
         return RawPost(
             post_urn=post_urn,
             author_name=author_name,
@@ -663,6 +732,8 @@ class LinkedInScraper:
             timestamp_text=timestamp_text,
             keyword_matched=keyword,
             extracted_urls=extracted_urls,
+            scraped_at=scraped_at,
+            posted_at=parse_relative_timestamp(timestamp_text, scraped_at),
         )
 
     async def _extract_posts_fallback(self, keyword: str, limit: Optional[int] = None) -> list[RawPost]:
@@ -710,11 +781,11 @@ class LinkedInScraper:
                     break
                 try:
                     text = (await block.inner_text()).strip()
-                    
+
                     # Immediately reject if this is a giant page wrapper containing the footer
                     if "Accessibility" in text and "Talent Solutions" in text and "Community Guidelines" in text:
                         continue
-                        
+
                     noise_patterns = [
                         r'Like\nComment\nRepost\nSend',
                         r'Like\s*Comment\s*Repost\s*Send',
@@ -728,7 +799,7 @@ class LinkedInScraper:
                         text = _re.sub(pattern, '', text, flags=_re.IGNORECASE)
                     text = text.strip()
 
-                    # A LinkedIn post can be short or very long. 
+                    # A LinkedIn post can be short or very long.
                     if len(text) < 30 or len(text) > 10000:
                         continue
                     if not any(kw in text.lower() for kw in [
@@ -749,16 +820,16 @@ class LinkedInScraper:
                         idx = 0
                         while idx < len(lines) and any(x in lines[idx].lower() for x in ["feed post", "suggested", "promoted", "reposted this"]):
                             idx += 1
-                            
+
                         if idx < len(lines):
                             author = lines[idx]
-                            
+
                             for i in range(idx + 1, min(idx + 6, len(lines))):
                                 line_lower = lines[i].lower()
                                 # Ignore connection degrees like '3rd+'
                                 if "degree connection" in line_lower or "1st" in line_lower or "2nd" in line_lower or "3rd" in line_lower:
                                     continue
-                                    
+
                                 if '•' in lines[i] and any(x in lines[i] for x in ['h', 'd', 'm', 'w', 'mo', 'yr', 's']):
                                     timestamp_text = lines[i].replace('•', '').strip()
                                     if i > idx:
@@ -787,7 +858,7 @@ class LinkedInScraper:
                                 urn = u
                     except Exception:
                         pass
-                        
+
                     post_url = ""
                     # Find any profile link
                     author_url = ""
@@ -817,14 +888,16 @@ class LinkedInScraper:
                         if existing.content in text:
                             posts.remove(existing)
                             break
-                            
+
                     if is_duplicate:
                         continue
 
                     post = RawPost(
                         post_urn=urn,
-                        author_name=author,
-                        author_headline=headline,
+                        author_name=resolve_author_name(
+                            "" if author == "Unknown" else author, text, author_url),
+                        author_headline=resolve_author_headline(
+                            headline, text, author),
                         content=text,
                         post_url=post_url,
                         author_url=author_url,
@@ -855,11 +928,8 @@ class LinkedInScraper:
         back to config. Does NOT sleep — the caller logs the value and then
         awaits it, so the "Waiting Xs" message appears before the wait.
         """
-        import random
-
         # Read max delay from database
         try:
-            from storage.database import Database
             db = Database(config.DATABASE_PATH)
             db.init_db()
             db_delay = db.get_setting("search_delay_max", "")
@@ -878,7 +948,6 @@ class LinkedInScraper:
         screenshots_dir = config.BASE_DIR / "data" / "screenshots"
         screenshots_dir.mkdir(parents=True, exist_ok=True)
 
-        from datetime import datetime
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = screenshots_dir / f"{name}_{timestamp}.png"
 

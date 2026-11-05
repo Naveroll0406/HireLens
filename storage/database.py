@@ -14,9 +14,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from processing.simhash import NEAR_DUPLICATE_MAX_DISTANCE, hamming_distance
 from storage.models import ParsedPost, RunStats
 
 logger = logging.getLogger(__name__)
+
+# Per-post workflow states the dashboard lets the user set.
+POST_STATUSES = ("new", "saved", "applied", "hidden", "not_relevant")
+
+
+def _to_signed64(value: int) -> int:
+    """SQLite INTEGER is signed 64-bit; SimHash is unsigned. Map losslessly."""
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _from_signed64(value: int) -> int:
+    return value + (1 << 64) if value < 0 else value
 
 
 class Database:
@@ -34,10 +47,9 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         """Open a connection (or return the existing one)."""
         if self._conn is None:
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
-            )
+            # No detect_types: timestamps are stored as ISO strings and read
+            # back as strings (sqlite3's default converter chokes on the 'T').
+            self._conn = sqlite3.connect(str(self.db_path))
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -82,6 +94,11 @@ class Database:
             author_url      TEXT,
             is_hiring       BOOLEAN DEFAULT 1,
             relevance_score INTEGER DEFAULT 0,
+            filter_reason   TEXT,
+            simhash         INTEGER DEFAULT 0,
+            posted_at       TIMESTAMP,
+            status          TEXT DEFAULT 'new',
+            status_updated_at TIMESTAMP,
             keyword_matched TEXT,
             run_id          INTEGER,
             first_seen_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -92,7 +109,18 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_posts_hash ON posts(content_hash);
         CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at);
 
-
+        -- User feedback on individual posts ("not relevant" + why). Mined
+        -- periodically to grow the reject lists in config.py.
+        CREATE TABLE IF NOT EXISTS feedback (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id     INTEGER NOT NULL,
+            verdict     TEXT NOT NULL,
+            reason      TEXT,
+            role        TEXT,
+            content     TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
+        );
 
         CREATE TABLE IF NOT EXISTS keywords (
             id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,11 +141,14 @@ class Database:
             keywords_searched   INTEGER DEFAULT 0,
             posts_found         INTEGER DEFAULT 0,
             new_posts           INTEGER DEFAULT 0,
+            notified            INTEGER DEFAULT 0,
+            status              TEXT DEFAULT 'ok',
+            deep_scan           BOOLEAN DEFAULT 0,
             errors              TEXT
         );
         """
         self.conn.executescript(schema)
-        
+
         # Safe migrations: add new columns if they don't exist from earlier versions
         for col_sql in [
             "ALTER TABLE posts ADD COLUMN emails TEXT;",
@@ -126,34 +157,131 @@ class Database:
             "ALTER TABLE posts ADD COLUMN run_id INTEGER;",
             "ALTER TABLE posts ADD COLUMN company_url TEXT;",
             "ALTER TABLE posts ADD COLUMN author_url TEXT;",
+            "ALTER TABLE posts ADD COLUMN filter_reason TEXT;",
+            "ALTER TABLE posts ADD COLUMN simhash INTEGER DEFAULT 0;",
+            "ALTER TABLE posts ADD COLUMN posted_at TIMESTAMP;",
+            "ALTER TABLE posts ADD COLUMN status TEXT DEFAULT 'new';",
+            "ALTER TABLE posts ADD COLUMN status_updated_at TIMESTAMP;",
+            "ALTER TABLE posts ADD COLUMN relevance_score INTEGER DEFAULT 0;",
+            "ALTER TABLE posts ADD COLUMN rule_score INTEGER DEFAULT 0;",
+            "ALTER TABLE posts ADD COLUMN scored_by TEXT DEFAULT 'rules';",
             "ALTER TABLE run_log ADD COLUMN duplicates_removed INTEGER DEFAULT 0;",
             "ALTER TABLE run_log ADD COLUMN filtered_out INTEGER DEFAULT 0;",
+            "ALTER TABLE run_log ADD COLUMN notified INTEGER DEFAULT 0;",
+            "ALTER TABLE run_log ADD COLUMN status TEXT DEFAULT 'ok';",
+            "ALTER TABLE run_log ADD COLUMN deep_scan BOOLEAN DEFAULT 0;",
+            "ALTER TABLE run_log ADD COLUMN scored_by TEXT DEFAULT 'rules';",
+            "CREATE INDEX IF NOT EXISTS idx_posts_posted ON posts(posted_at);",
+            "CREATE INDEX IF NOT EXISTS idx_posts_score ON posts(relevance_score);",
+            "CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status);",
         ]:
             try:
                 self.conn.execute(col_sql)
             except sqlite3.OperationalError:
                 pass
-            
+
+        # Enforce (author, content) uniqueness at the DB level. Older databases
+        # may already hold duplicates, in which case the index can't be built —
+        # the Python-side dedup still protects us and we log it.
+        try:
+            self.conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_author_hash "
+                "ON posts(author_name, content_hash)"
+            )
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "posts has pre-existing (author, content_hash) duplicates; "
+                "unique index not created."
+            )
+
+        self._init_fts()
         self.conn.commit()
         logger.info("Database schema initialized.")
+
+    def _init_fts(self):
+        """Create the FTS5 full-text index over posts, kept in sync by triggers.
+
+        Falls back silently (LIKE search) if this SQLite build lacks FTS5.
+        """
+        try:
+            self.conn.executescript("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(
+                content, role, author_name, skills,
+                content='posts', content_rowid='id',
+                tokenize='porter unicode61'
+            );
+            CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
+                INSERT INTO posts_fts(rowid, content, role, author_name, skills)
+                VALUES (new.id, new.content, new.role, new.author_name, new.skills);
+            END;
+            CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
+                INSERT INTO posts_fts(posts_fts, rowid, content, role, author_name, skills)
+                VALUES ('delete', old.id, old.content, old.role, old.author_name, old.skills);
+            END;
+            CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE OF content, role, author_name, skills ON posts BEGIN
+                INSERT INTO posts_fts(posts_fts, rowid, content, role, author_name, skills)
+                VALUES ('delete', old.id, old.content, old.role, old.author_name, old.skills);
+                INSERT INTO posts_fts(rowid, content, role, author_name, skills)
+                VALUES (new.id, new.content, new.role, new.author_name, new.skills);
+            END;
+            """)
+            # Backfill rows inserted before the index existed (idempotent).
+            self.conn.execute("INSERT INTO posts_fts(posts_fts) VALUES ('rebuild')")
+            self._fts_available = True
+        except sqlite3.OperationalError as e:
+            logger.warning("FTS5 unavailable (%s); dashboard search will use LIKE.", e)
+            self._fts_available = False
+
+    @property
+    def fts_available(self) -> bool:
+        return getattr(self, "_fts_available", False)
 
     # ------------------------------------------------------------------
     # Posts
     # ------------------------------------------------------------------
 
     def is_duplicate(self, post_urn: str, content_hash: str, author_name: str) -> bool:
-        """Check if a post already exists by URN, or by exact same content from the same author."""
+        """Check if a post already exists by URN, or by exact same content from the same author.
+
+        Two separate lookups so each one can use its own index (SQLite can't
+        combine two indexes across an OR).
+        """
         if post_urn:
-            cursor = self.conn.execute(
-                "SELECT 1 FROM posts WHERE post_urn = ? OR (content_hash = ? AND author_name = ?) LIMIT 1",
-                (post_urn, content_hash, author_name),
-            )
-        else:
-            cursor = self.conn.execute(
-                "SELECT 1 FROM posts WHERE content_hash = ? AND author_name = ? LIMIT 1",
-                (content_hash, author_name),
-            )
-        return cursor.fetchone() is not None
+            row = self.conn.execute(
+                "SELECT 1 FROM posts WHERE post_urn = ? LIMIT 1", (post_urn,)
+            ).fetchone()
+            if row is not None:
+                return True
+        row = self.conn.execute(
+            "SELECT 1 FROM posts WHERE content_hash = ? AND author_name = ? LIMIT 1",
+            (content_hash, author_name),
+        ).fetchone()
+        return row is not None
+
+    def find_near_duplicates(self, fingerprint: int, lookback_days: int = 21,
+                             max_distance: int = NEAR_DUPLICATE_MAX_DISTANCE) -> list[dict]:
+        """Recent posts whose SimHash is within max_distance bits of ``fingerprint``.
+
+        Returns dicts with id / role / experience_min / experience_max so the
+        caller can apply a semantic tie-break. Scans only recent, fingerprinted
+        rows so the linear Hamming check stays cheap.
+        """
+        if not fingerprint:
+            return []
+        cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        cursor = self.conn.execute(
+            "SELECT id, simhash, role, experience_min, experience_max FROM posts "
+            "WHERE simhash != 0 AND created_at >= ?",
+            (cutoff,),
+        )
+        matches = []
+        for row in cursor:
+            if hamming_distance(_from_signed64(int(row["simhash"])), fingerprint) <= max_distance:
+                matches.append({
+                    "id": row["id"], "role": row["role"],
+                    "experience_min": row["experience_min"], "experience_max": row["experience_max"],
+                })
+        return matches
 
     def insert_post(self, parsed: ParsedPost, run_id: int | None = None) -> int:
         """Insert a new post into the database. Returns the row id."""
@@ -164,8 +292,9 @@ class Database:
                 (post_urn, post_url, author_name, author_headline,
                  content, content_hash, role, experience_min, experience_max,
                  locations, skills, emails, primary_url, extracted_urls, company_url, author_url,
-                 is_hiring, keyword_matched, run_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_hiring, relevance_score, filter_reason, simhash, posted_at,
+                 keyword_matched, run_id, rule_score, scored_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 raw.post_urn or None,
@@ -185,12 +314,66 @@ class Database:
                 parsed.company_url or "",
                 parsed.author_url or "",
                 parsed.is_hiring,
+                parsed.relevance_score,
+                parsed.filter_reason,
+                _to_signed64(raw.simhash),
+                raw.posted_at.isoformat() if raw.posted_at else None,
                 raw.keyword_matched,
                 run_id,
+                parsed.rule_score,
+                parsed.scored_by,
             ),
         )
         self.conn.commit()
         return cursor.lastrowid
+
+    def set_post_status(self, post_id: int, status: str):
+        """Set the user's workflow status on a post (saved / applied / hidden ...)."""
+        if status not in POST_STATUSES:
+            raise ValueError(f"Unknown status {status!r}; expected one of {POST_STATUSES}")
+        self.conn.execute(
+            "UPDATE posts SET status = ?, status_updated_at = ? WHERE id = ?",
+            (status, datetime.now().isoformat(), post_id),
+        )
+        self.conn.commit()
+
+    def add_feedback(self, post_id: int, verdict: str, reason: str = ""):
+        """Record why the user marked a post as (not) relevant, with a content snapshot."""
+        row = self.conn.execute(
+            "SELECT role, content FROM posts WHERE id = ?", (post_id,)
+        ).fetchone()
+        self.conn.execute(
+            "INSERT INTO feedback (post_id, verdict, reason, role, content) VALUES (?, ?, ?, ?, ?)",
+            (post_id, verdict, reason.strip(), row["role"] if row else None, row["content"] if row else None),
+        )
+        self.conn.commit()
+
+    def get_feedback(self, limit: int = 200) -> list[dict]:
+        cursor = self.conn.execute(
+            "SELECT id, post_id, verdict, reason, role, created_at FROM feedback "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    def feedback_phrase_counts(self, min_count: int = 2) -> list[tuple[str, int]]:
+        """Most common words/bigrams in 'not relevant' feedback reasons.
+
+        This is the manual tuning loop: review these and promote the
+        recurring ones to NON_HIRING_SIGNALS / ABSOLUTE_REJECT_PHRASES.
+        """
+        import re
+        from collections import Counter
+
+        counts: Counter[str] = Counter()
+        cursor = self.conn.execute(
+            "SELECT reason FROM feedback WHERE verdict = 'not_relevant' AND reason != ''"
+        )
+        for row in cursor:
+            words = re.findall(r"[a-z][a-z'-]+", row["reason"].lower())
+            counts.update(words)
+            counts.update(f"{a} {b}" for a, b in zip(words, words[1:]))
+        return [(p, c) for p, c in counts.most_common(50) if c >= min_count]
 
     def get_post_id_by_urn(self, post_urn: str) -> Optional[int]:
         """Get the internal post ID by LinkedIn URN."""
@@ -266,29 +449,68 @@ class Database:
     # Run log
     # ------------------------------------------------------------------
 
-    def log_run(self, stats: RunStats):
-        """Record the results of a monitor run."""
-        self.conn.execute(
+    def log_run(self, stats: RunStats) -> int:
+        """Insert a run_log row and return its id. Call update_run() to finalise it."""
+        cursor = self.conn.execute(
             """
             INSERT INTO run_log
                 (started_at, completed_at, keywords_searched,
-                 posts_found, duplicates_removed, filtered_out, new_posts, errors)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 posts_found, duplicates_removed, filtered_out, new_posts,
+                 notified, status, deep_scan, errors, scored_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                stats.started_at.isoformat(),
-                stats.completed_at.isoformat() if stats.completed_at else None,
-                stats.keywords_searched,
-                stats.posts_found,
-                stats.duplicates_removed,
-                stats.filtered_out,
-                stats.new_posts,
-                json.dumps(stats.errors) if stats.errors else None,
-            ),
+            self._run_row(stats),
         )
         self.conn.commit()
-        # Return the run_log id so callers can associate posts with this run
-        return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return cursor.lastrowid
+
+    def update_run(self, run_id: int, stats: RunStats):
+        """Overwrite a run_log row with the final stats."""
+        self.conn.execute(
+            """
+            UPDATE run_log SET
+                started_at = ?, completed_at = ?, keywords_searched = ?,
+                posts_found = ?, duplicates_removed = ?, filtered_out = ?, new_posts = ?,
+                notified = ?, status = ?, deep_scan = ?, errors = ?, scored_by = ?
+            WHERE id = ?
+            """,
+            (*self._run_row(stats), run_id),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _run_row(stats: RunStats) -> tuple:
+        return (
+            stats.started_at.isoformat(),
+            stats.completed_at.isoformat() if stats.completed_at else None,
+            stats.keywords_searched,
+            stats.posts_found,
+            stats.duplicates_removed,
+            stats.filtered_out,
+            stats.new_posts,
+            stats.notified,
+            stats.status,
+            int(stats.deep_scan),
+            json.dumps(stats.errors) if stats.errors else None,
+            stats.scored_by,
+        )
+
+    def last_run_status(self) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT status FROM run_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["status"] if row else None
+
+    def last_deep_scan_at(self) -> Optional[datetime]:
+        row = self.conn.execute(
+            "SELECT started_at FROM run_log WHERE deep_scan = 1 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row or not row["started_at"]:
+            return None
+        try:
+            return datetime.fromisoformat(row["started_at"])
+        except ValueError:
+            return None
 
     # ------------------------------------------------------------------
     # Statistics

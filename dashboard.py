@@ -1,604 +1,79 @@
 """
-LinkedIn AI Job Post Monitor — Streamlit Dashboard
+HireLens — Streamlit dashboard.
 
-A real-time dashboard to visualize scraped job opportunities,
-run the scraper with a custom URL, and manage settings.
+Visualises scraped hiring posts, runs the scraper against a pasted LinkedIn
+search URL, and exposes the keyword / filter / scheduler settings.
+
+Layout lives in :mod:`ui.components`, styling in :mod:`ui.theme`, and the
+background scraper in :mod:`ui.runner`; this module is the wiring plus the
+database reads.
 
 Usage:
-  conda activate linkedin
   streamlit run dashboard.py
 """
 
 from __future__ import annotations
-import re
-import json
+
 import sqlite3
-import subprocess
 import sys
-import threading
-import time
+from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 # Ensure the project root is on the Python path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
+from processing import llm_scoring
+from processing.parser import resolve_author_headline, resolve_author_name
+from storage.database import POST_STATUSES, Database
+from ui import components as C
+from ui import runner, theme
+
+STATUS_LABELS = {
+    "new": "🆕 New",
+    "saved": "⭐ Saved",
+    "applied": "✅ Applied",
+    "hidden": "🙈 Hidden",
+    "not_relevant": "🚫 Not relevant",
+}
 
 # ---------------------------------------------------------------------------
-# Page Configuration
+# Page configuration + theme
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="LinkedIn AI Job Monitor",
+    page_title="HireLens — AI hiring radar",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# ---------------------------------------------------------------------------
-# Custom CSS — Premium dark theme with always-visible sidebar
-# ---------------------------------------------------------------------------
-
-st.markdown("""
-<style>
-    /* Import Google Font */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
-    /* Root variables */
-    :root {
-        --bg-primary: #0a0a1a;
-        --bg-card: rgba(20, 20, 45, 0.7);
-        --bg-glass: rgba(255, 255, 255, 0.04);
-        --border-glass: rgba(255, 255, 255, 0.08);
-        --accent-blue: #4f8cff;
-        --accent-purple: #a855f7;
-        --accent-green: #22c55e;
-        --accent-orange: #f59e0b;
-        --accent-red: #ef4444;
-        --accent-cyan: #06b6d4;
-        --text-primary: #f1f5f9;
-        --text-secondary: #94a3b8;
-        --text-muted: #64748b;
-    }
-
-    /* Global */
-    .stApp {
-        font-family: 'Inter', sans-serif !important;
-        background:
-            radial-gradient(1100px 600px at 12% -8%, rgba(79, 140, 255, 0.14), transparent 60%),
-            radial-gradient(900px 550px at 92% 4%, rgba(168, 85, 247, 0.13), transparent 58%),
-            radial-gradient(800px 700px at 50% 108%, rgba(6, 182, 212, 0.10), transparent 60%),
-            var(--bg-primary) !important;
-        background-attachment: fixed !important;
-    }
-
-    /* Constrain and center the main content for a calmer layout */
-    .block-container {
-        max-width: 1300px;
-        padding-top: 2rem !important;
-    }
-
-    /* ===== FORCE SIDEBAR ALWAYS VISIBLE ===== */
-    /* Prevent sidebar from collapsing */
-    section[data-testid="stSidebar"] {
-        min-width: 340px !important;
-        max-width: 400px !important;
-        background: rgba(10, 10, 26, 0.95) !important;
-        border-right: 1px solid var(--border-glass) !important;
-    }
-
-    /* Hide the sidebar collapse button */
-    button[data-testid="stSidebarCollapseButton"],
-    [data-testid="stSidebarCollapsedControl"],
-    button[kind="headerNoPadding"] {
-        display: none !important;
-        visibility: hidden !important;
-    }
-
-    /* Prevent sidebar from being hidden */
-    section[data-testid="stSidebar"][aria-expanded="false"] {
-        display: block !important;
-        min-width: 340px !important;
-        transform: none !important;
-        margin-left: 0 !important;
-    }
-
-    /* Main header */
-    .main-header {
-        background: linear-gradient(135deg, rgba(79, 140, 255, 0.15) 0%, rgba(168, 85, 247, 0.15) 50%, rgba(6, 182, 212, 0.15) 100%);
-        border: 1px solid var(--border-glass);
-        border-radius: 20px;
-        padding: 1.5rem 2rem;
-        margin-bottom: 1.5rem;
-        backdrop-filter: blur(20px);
-        position: relative;
-        overflow: hidden;
-    }
-
-    .main-header::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: 3px;
-        background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple), var(--accent-cyan));
-    }
-
-    .main-header h1 {
-        font-size: 1.8rem;
-        font-weight: 800;
-        background: linear-gradient(135deg, #4f8cff, #a855f7, #06b6d4);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0 0 0.3rem 0;
-        letter-spacing: -0.02em;
-    }
-
-    .main-header p {
-        color: var(--text-secondary);
-        font-size: 0.95rem;
-        margin: 0;
-        font-weight: 400;
-    }
-
-    /* URL input box styling */
-    .url-input-section {
-        background: linear-gradient(135deg, rgba(79, 140, 255, 0.08) 0%, rgba(168, 85, 247, 0.08) 100%);
-        border: 1px solid rgba(79, 140, 255, 0.2);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin-bottom: 1.5rem;
-    }
-
-    .url-input-section h3 {
-        margin: 0 0 0.5rem 0;
-        font-size: 1.1rem;
-        font-weight: 700;
-    }
-
-    .url-input-section p {
-        color: var(--text-secondary);
-        font-size: 0.85rem;
-        margin: 0 0 0.75rem 0;
-    }
-
-    /* Metric cards */
-    .metric-card {
-        background: var(--bg-glass);
-        border: 1px solid var(--border-glass);
-        border-radius: 16px;
-        padding: 1.25rem;
-        text-align: center;
-        backdrop-filter: blur(12px);
-        transition: all 0.3s ease;
-    }
-
-    .metric-card:hover {
-        border-color: rgba(79, 140, 255, 0.3);
-        transform: translateY(-2px);
-        box-shadow: 0 8px 32px rgba(79, 140, 255, 0.1);
-    }
-
-    .metric-value {
-        font-size: 2.2rem;
-        font-weight: 800;
-        letter-spacing: -0.02em;
-        line-height: 1;
-        margin-bottom: 0.4rem;
-    }
-
-    .metric-label {
-        font-size: 0.8rem;
-        color: var(--text-secondary);
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-    }
-
-    .blue { color: var(--accent-blue); }
-    .purple { color: var(--accent-purple); }
-    .green { color: var(--accent-green); }
-    .orange { color: var(--accent-orange); }
-    .cyan { color: var(--accent-cyan); }
-
-    /* Job card */
-    .job-card {
-        background: var(--bg-glass);
-        border: 1px solid var(--border-glass);
-        border-radius: 16px;
-        padding: 1.5rem;
-        margin-bottom: 1rem;
-        backdrop-filter: blur(12px);
-        transition: all 0.3s ease;
-        position: relative;
-        overflow: hidden;
-    }
-
-    .job-card::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 4px;
-        height: 100%;
-        background: linear-gradient(180deg, var(--accent-blue), var(--accent-purple));
-        border-radius: 4px 0 0 4px;
-    }
-
-    .job-card:hover {
-        border-color: rgba(79, 140, 255, 0.25);
-        box-shadow: 0 4px 24px rgba(79, 140, 255, 0.08);
-    }
-
-    .job-title {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: var(--text-primary);
-        margin-bottom: 0.6rem;
-    }
-
-    .job-meta {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.8rem;
-        margin-bottom: 0.6rem;
-    }
-
-    .job-meta-item {
-        display: flex;
-        align-items: center;
-        gap: 0.3rem;
-        font-size: 0.85rem;
-        color: var(--text-secondary);
-    }
-
-    .job-skills {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.4rem;
-        margin-top: 0.6rem;
-    }
-
-    .skill-tag {
-        background: rgba(79, 140, 255, 0.12);
-        color: var(--accent-blue);
-        border: 1px solid rgba(79, 140, 255, 0.2);
-        border-radius: 8px;
-        padding: 0.2rem 0.6rem;
-        font-size: 0.78rem;
-        font-weight: 500;
-    }
-
-    .job-content-preview {
-        color: var(--text-muted);
-        font-size: 0.85rem;
-        line-height: 1.6;
-        margin-top: 0.6rem;
-        padding: 0.8rem;
-        background: rgba(0,0,0,0.2);
-        border-radius: 8px;
-        max-height: 400px;
-        overflow-y: auto;
-        white-space: pre-wrap;
-        word-break: break-word;
-    }
-
-    .job-link {
-        display: inline-block;
-        margin-top: 0.6rem;
-        color: var(--accent-cyan);
-        text-decoration: none;
-        font-weight: 600;
-        font-size: 0.88rem;
-        transition: color 0.2s;
-    }
-
-    .job-link:hover {
-        color: var(--accent-blue);
-    }
-
-    .apply-section {
-        background: linear-gradient(135deg, rgba(34, 197, 94, 0.08) 0%, rgba(34, 197, 94, 0.15) 100%);
-        border: 1px solid rgba(34, 197, 94, 0.25);
-        border-radius: 12px;
-        padding: 0.8rem 1rem;
-        margin-bottom: 0.8rem;
-    }
-
-    .apply-section-label {
-        font-size: 0.72rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--accent-green);
-        margin-bottom: 0.4rem;
-    }
-
-    .apply-link {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.4rem;
-        padding: 0.45rem 1rem;
-        background: rgba(34, 197, 94, 0.18);
-        color: var(--accent-green);
-        border: 1px solid rgba(34, 197, 94, 0.35);
-        border-radius: 10px;
-        text-decoration: none;
-        font-weight: 700;
-        font-size: 0.85rem;
-        transition: all 0.25s ease;
-        margin-right: 0.5rem;
-        margin-bottom: 0.3rem;
-    }
-
-    .apply-link:hover {
-        background: rgba(34, 197, 94, 0.3);
-        transform: translateY(-2px);
-        box-shadow: 0 4px 16px rgba(34, 197, 94, 0.15);
-    }
-
-    .company-link {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.4rem;
-        padding: 0.4rem 0.9rem;
-        background: rgba(79, 140, 255, 0.1);
-        color: var(--accent-blue);
-        border: 1px solid rgba(79, 140, 255, 0.25);
-        border-radius: 10px;
-        text-decoration: none;
-        font-weight: 600;
-        font-size: 0.82rem;
-        transition: all 0.25s ease;
-    }
-
-    .company-link:hover {
-        background: rgba(79, 140, 255, 0.2);
-        transform: translateY(-1px);
-    }
-
-    .no-link-message {
-        color: var(--text-muted);
-        font-size: 0.8rem;
-        font-style: italic;
-        padding: 0.3rem 0;
-    }
-
-    .platform-badge {
-        display: inline-block;
-        padding: 0.2rem 0.55rem;
-        border-radius: 6px;
-        font-size: 0.72rem;
-        font-weight: 600;
-        letter-spacing: 0.03em;
-        background: rgba(168, 85, 247, 0.12);
-        color: var(--accent-purple);
-        border: 1px solid rgba(168, 85, 247, 0.2);
-    }
-
-    .apply-url-text {
-        font-size: 0.75rem;
-        color: var(--text-muted);
-        word-break: break-all;
-        margin-top: 0.2rem;
-    }
-
-    /* Status badges */
-    .status-badge {
-        display: inline-block;
-        padding: 0.3rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        letter-spacing: 0.03em;
-    }
-
-    .status-running {
-        background: rgba(34, 197, 94, 0.15);
-        color: var(--accent-green);
-        border: 1px solid rgba(34, 197, 94, 0.3);
-        animation: pulse 2s ease-in-out infinite;
-    }
-
-    .status-idle {
-        background: rgba(100, 116, 139, 0.15);
-        color: var(--text-secondary);
-        border: 1px solid rgba(100, 116, 139, 0.3);
-    }
-
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.6; }
-    }
-
-    /* Run log entry */
-    .run-log-entry {
-        background: var(--bg-glass);
-        border: 1px solid var(--border-glass);
-        border-radius: 10px;
-        padding: 0.75rem 1rem;
-        margin-bottom: 0.5rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: 0.5rem;
-        font-size: 0.85rem;
-    }
-
-    /* Streamlit element overrides */
-    .stButton > button {
-        border-radius: 12px !important;
-        font-weight: 600 !important;
-        font-family: 'Inter', sans-serif !important;
-        transition: all 0.3s ease !important;
-    }
-
-    .stButton > button:hover {
-        transform: translateY(-1px) !important;
-        box-shadow: 0 4px 16px rgba(79, 140, 255, 0.2) !important;
-    }
-
-    div[data-testid="stExpander"] {
-        border: 1px solid var(--border-glass) !important;
-        border-radius: 12px !important;
-        background: var(--bg-glass) !important;
-    }
-
-    /* Scrollbar */
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
-
-    /* ===== Tabs ===== */
-    div[data-testid="stTabs"] div[role="tablist"] {
-        gap: 0.4rem;
-        border-bottom: 1px solid var(--border-glass) !important;
-        padding-bottom: 0.2rem;
-    }
-    div[data-testid="stTabs"] button[role="tab"] {
-        background: var(--bg-glass) !important;
-        border: 1px solid var(--border-glass) !important;
-        border-radius: 12px 12px 0 0 !important;
-        padding: 0.55rem 1.1rem !important;
-        color: var(--text-secondary) !important;
-        font-weight: 600 !important;
-        transition: all 0.25s ease !important;
-    }
-    div[data-testid="stTabs"] button[role="tab"]:hover {
-        color: var(--text-primary) !important;
-        border-color: rgba(79, 140, 255, 0.35) !important;
-    }
-    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
-        color: var(--text-primary) !important;
-        background: linear-gradient(135deg, rgba(79,140,255,0.18), rgba(168,85,247,0.18)) !important;
-        border-color: rgba(79,140,255,0.4) !important;
-        box-shadow: 0 -2px 16px rgba(79,140,255,0.12);
-    }
-    div[data-testid="stTabs"] div[role="tablist"] [data-baseweb="tab-highlight"],
-    div[data-testid="stTabs"] div[role="tablist"] [data-baseweb="tab-border"] {
-        background: transparent !important;
-    }
-
-    /* ===== Primary button — gradient ===== */
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple)) !important;
-        border: none !important;
-        color: #fff !important;
-        box-shadow: 0 4px 18px rgba(79,140,255,0.28) !important;
-    }
-    .stButton > button[kind="primary"]:hover {
-        filter: brightness(1.08);
-        box-shadow: 0 6px 24px rgba(79,140,255,0.4) !important;
-    }
-
-    /* ===== Metric cards (st.metric) ===== */
-    div[data-testid="stMetric"] {
-        background: var(--bg-glass);
-        border: 1px solid var(--border-glass);
-        border-radius: 14px;
-        padding: 1rem 1.1rem;
-        backdrop-filter: blur(12px);
-        transition: all 0.3s ease;
-    }
-    div[data-testid="stMetric"]:hover {
-        border-color: rgba(79,140,255,0.3);
-        transform: translateY(-2px);
-        box-shadow: 0 8px 28px rgba(79,140,255,0.1);
-    }
-    div[data-testid="stMetricValue"] {
-        font-weight: 800 !important;
-        letter-spacing: -0.02em;
-    }
-
-    /* ===== Inputs ===== */
-    .stTextInput input, .stNumberInput input, div[data-baseweb="select"] > div {
-        background: var(--bg-glass) !important;
-        border: 1px solid var(--border-glass) !important;
-        border-radius: 10px !important;
-        color: var(--text-primary) !important;
-    }
-    .stTextInput input:focus, .stNumberInput input:focus {
-        border-color: rgba(79,140,255,0.5) !important;
-        box-shadow: 0 0 0 2px rgba(79,140,255,0.15) !important;
-    }
-
-    /* ===== Run log entry — richer ===== */
-    .run-log-entry {
-        transition: all 0.25s ease;
-    }
-    .run-log-entry:hover {
-        border-color: rgba(79,140,255,0.3);
-        transform: translateX(2px);
-        background: rgba(79,140,255,0.05);
-    }
-    .run-log-entry span {
-        color: var(--text-secondary);
-        font-weight: 500;
-    }
-
-    /* Section headings a touch tighter */
-    h3 { letter-spacing: -0.01em; }
-
-    /* Hide Streamlit branding */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-</style>
-""", unsafe_allow_html=True)
+theme.inject()
 
 
-# ---------------------------------------------------------------------------
-# All available locations for the editable checklist
-# ---------------------------------------------------------------------------
-
-ALL_LOCATIONS = [
-    "Hyderabad",
-    "Bangalore",
-    "Bengaluru",
-    "Pune",
-    "Chennai",
-    "Mumbai",
-    "Gurgaon",
-    "Gurugram",
-    "Noida",
-    "Delhi",
-    "Kolkata",
-    "Ahmedabad",
-    "Jaipur",
-    "Kochi",
-    "Thiruvananthapuram",
-    "Indore",
-    "Chandigarh",
-    "Coimbatore",
-    "Lucknow",
-    "Nagpur",
-    "Remote",
-    "Work From Home",
-    "India",
-    "USA",
-    "Singapore",
-    "Dubai",
-    "London",
-    "Canada",
-    "Germany",
-    "Australia",
-]
+@dataclass
+class Filters:
+    """Everything the sidebar controls, passed down to the queries."""
+    search_text: str = ""
+    hiring_only: bool = True
+    location: str = "All"
+    max_results: int = 50
+    exp_range: tuple[int, int] = (0, 15)
+    min_score: int = 0
+    statuses: list[str] = field(default_factory=list)
+    group_by_author: bool = False
 
 
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
 
-def get_db_connection():
-    """Get a read-only SQLite connection."""
+def get_db_connection() -> sqlite3.Connection | None:
+    """Open a read connection, or None when the database does not exist yet."""
     db_path = config.DATABASE_PATH
     if not db_path.exists():
         return None
@@ -607,800 +82,918 @@ def get_db_connection():
     return conn
 
 
-def ensure_db():
-    """Ensure the database exists and is initialized."""
-    from storage.database import Database
-    db = Database(config.DATABASE_PATH)
-    db.init_db()
-    db.seed_default_keywords(config.DEFAULT_KEYWORDS)
-    db.close()
+@st.cache_resource
+def ensure_db() -> bool:
+    """Initialise the schema once per server process, not once per rerun."""
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        db.seed_default_keywords(config.DEFAULT_KEYWORDS)
+    return True
 
 
-def load_posts(limit: int = 100, hiring_only: bool = True,
-               search_text: str = "", location_filter: str = "All",
-               exp_range: tuple[int, int] = (0, 15)) -> pd.DataFrame:
-    """Load posts from the database as a DataFrame."""
+def invalidate_caches() -> None:
+    """Drop cached aggregates after anything writes to the database."""
+    for fn in (get_stats, get_found_locations, get_top_skills, get_keywords,
+               get_location_counts):
+        fn.clear()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def gemini_status() -> tuple[bool, str]:
+    """Is the Gemini key usable?  Cached - it is a real network round trip."""
+    return llm_scoring.check_key()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fts_available() -> bool:
+    """Whether the posts_fts virtual table exists (SQLite built with FTS5)."""
     conn = get_db_connection()
     if conn is None:
-        return pd.DataFrame()
-
-    query = "SELECT * FROM posts WHERE 1=1"
-    params = []
-
-    if hiring_only:
-        query += " AND is_hiring = 1"
-
-    if search_text:
-        query += " AND (content LIKE ? OR role LIKE ? OR author_name LIKE ?)"
-        like = f"%{search_text}%"
-        params.extend([like, like, like])
-
-    if location_filter and location_filter != "All":
-        query += " AND locations LIKE ?"
-        params.append(f"%{location_filter}%")
-        
-    # Simple experience filtering: if the post has exp min/max, check if it overlaps with selected range
-    # Or if experience is null, we usually still include it unless strictly requested otherwise
-    query += " AND (experience_min IS NULL OR experience_min <= ?)"
-    params.append(exp_range[1])
-    query += " AND (experience_max IS NULL OR experience_max >= ?)"
-    params.append(exp_range[0])
-
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
+        return False
+    with closing(conn):
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='posts_fts'"
+        ).fetchone()
+    return row is not None
 
 
-def load_new_posts(since_run_id: int | None = None, hiring_only: bool = True,
-                   search_text: str = "", location_filter: str = "All",
-                   exp_range: tuple[int, int] = (0, 15)) -> pd.DataFrame:
-    """Load new posts. If since_run_id is None, loads the very latest run's posts."""
-    conn = get_db_connection()
-    if conn is None:
-        return pd.DataFrame()
+def _fts_query(text: str) -> str:
+    """Turn free text into a safe FTS5 MATCH expression.
 
-    query = "SELECT * FROM posts WHERE "
+    Words are AND-ed; a leading '-' negates ("python rag -senior").
+    Everything is quoted so user input cannot break the query grammar.
+    """
+    terms = []
+    for tok in text.split():
+        neg = tok.startswith("-") and len(tok) > 1
+        word = (tok[1:] if neg else tok).replace('"', "")
+        if not word:
+            continue
+        terms.append(('NOT "' if neg else '"') + word + '"*')
+    # A query that is only negations is invalid FTS5; anchor it with a wildcard.
+    if terms and all(t.startswith("NOT") for t in terms):
+        terms.insert(0, '"*"')
+    return " ".join(terms)
+
+
+def _post_filters_sql(f: Filters) -> tuple[str, list]:
+    """Shared WHERE clause for the post views."""
+    where = " WHERE 1=1"
     params: list = []
-    
+
+    if f.hiring_only:
+        where += " AND is_hiring = 1"
+    if f.min_score > 0:
+        where += " AND COALESCE(relevance_score, 0) >= ?"
+        params.append(f.min_score)
+    if f.statuses:
+        placeholders = ",".join("?" * len(f.statuses))
+        where += f" AND COALESCE(status, 'new') IN ({placeholders})"
+        params.extend(f.statuses)
+
+    if f.search_text.strip():
+        if fts_available():
+            where += " AND id IN (SELECT rowid FROM posts_fts WHERE posts_fts MATCH ?)"
+            params.append(_fts_query(f.search_text))
+        else:
+            where += " AND (content LIKE ? OR role LIKE ? OR author_name LIKE ?)"
+            like = f"%{f.search_text}%"
+            params.extend([like, like, like])
+
+    if f.location and f.location != "All":
+        where += " AND locations LIKE ?"
+        params.append(f'%"{f.location}"%')
+
+    # Posts with no stated experience are always shown.
+    where += " AND (experience_min IS NULL OR experience_min <= ?)"
+    params.append(f.exp_range[1])
+    where += " AND (experience_max IS NULL OR experience_max >= ?)"
+    params.append(f.exp_range[0])
+    return where, params
+
+
+# Newest *posted* first; fall back to when we found it for older rows.
+_ORDER_BY = " ORDER BY COALESCE(posted_at, created_at) DESC, id DESC"
+
+
+def load_posts(f: Filters) -> pd.DataFrame:
+    """Load posts matching the sidebar filters."""
+    conn = get_db_connection()
+    if conn is None:
+        return pd.DataFrame()
+    where, params = _post_filters_sql(f)
+    with closing(conn):
+        return pd.read_sql_query(
+            "SELECT * FROM posts" + where + _ORDER_BY + " LIMIT ?",
+            conn, params=params + [f.max_results],
+        )
+
+
+def load_new_posts(f: Filters, since_run_id: int | None = None) -> pd.DataFrame:
+    """Posts from the latest run, or everything after *since_run_id*."""
+    conn = get_db_connection()
+    if conn is None:
+        return pd.DataFrame()
+    where, params = _post_filters_sql(f)
     if since_run_id is not None:
-        query += "run_id > ?"
+        where += " AND run_id > ?"
         params.append(since_run_id)
     else:
-        query += "1=1"
+        where += " AND run_id = (SELECT MAX(run_id) FROM posts)"
+    with closing(conn):
+        return pd.read_sql_query("SELECT * FROM posts" + where + _ORDER_BY, conn, params=params)
 
-    if hiring_only:
-        query += " AND is_hiring = 1"
 
-    if search_text:
-        query += " AND (content LIKE ? OR role LIKE ? OR author_name LIKE ?)"
-        like = f"%{search_text}%"
-        params.extend([like, like, like])
+def set_post_status(post_id: int, status: str, feedback_reason: str = "") -> None:
+    """Persist a status change (and feedback when marking not relevant)."""
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        db.set_post_status(int(post_id), status)
+        if status == "not_relevant":
+            db.add_feedback(int(post_id), "not_relevant", feedback_reason)
+        elif status in ("saved", "applied"):
+            db.add_feedback(int(post_id), "relevant", "")
+    invalidate_caches()
 
-    if location_filter and location_filter != "All":
-        query += " AND locations LIKE ?"
-        params.append(f"%{location_filter}%")
 
-    query += " AND (experience_min IS NULL OR experience_min <= ?)"
-    params.append(exp_range[1])
-    query += " AND (experience_max IS NULL OR experience_max >= ?)"
-    params.append(exp_range[0])
+def load_feedback(limit: int = 100) -> pd.DataFrame:
+    conn = get_db_connection()
+    if conn is None:
+        return pd.DataFrame()
+    with closing(conn):
+        try:
+            return pd.read_sql_query(
+                "SELECT f.created_at, f.verdict, f.reason, f.role, f.post_id "
+                "FROM feedback f ORDER BY f.created_at DESC LIMIT ?",
+                conn, params=[limit],
+            )
+        except (pd.errors.DatabaseError, sqlite3.DatabaseError):
+            return pd.DataFrame()
 
-    query += " ORDER BY created_at DESC"
 
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    
-    if since_run_id is None and not df.empty and 'run_id' in df.columns:
-        df = df[df['run_id'] == df['run_id'].max()]
-        
-    return df
+def feedback_phrases() -> list[tuple[str, int]]:
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        return db.feedback_phrase_counts(min_count=2)
+
+
+def get_setting(key: str, default: str) -> str:
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        return db.get_setting(key, default)
+
+
+def set_setting(key: str, value) -> None:
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        db.set_setting(key, str(value))
+
+
+def export_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Flat, human-readable columns for CSV/JSON export."""
+    cols = [
+        "id", "relevance_score", "status", "role", "author_name", "author_headline",
+        "locations", "experience_min", "experience_max", "skills", "emails",
+        "primary_url", "extracted_urls", "company_url", "author_url", "post_url",
+        "posted_at", "created_at", "keyword_matched", "filter_reason", "content",
+    ]
+    out = df[[c for c in cols if c in df.columns]].copy()
+    for col in ("locations", "skills", "emails", "extracted_urls"):
+        if col in out.columns:
+            out[col] = out[col].apply(lambda v: ", ".join(C.parse_json_list(v)))
+    return out
 
 
 def load_run_logs(limit: int = 20) -> pd.DataFrame:
-    """Load recent run logs."""
     conn = get_db_connection()
     if conn is None:
         return pd.DataFrame()
-
-    df = pd.read_sql_query(
-        "SELECT * FROM run_log ORDER BY started_at DESC LIMIT ?",
-        conn, params=[limit]
-    )
-    conn.close()
-    return df
+    with closing(conn):
+        return pd.read_sql_query(
+            "SELECT * FROM run_log ORDER BY started_at DESC LIMIT ?", conn, params=[limit]
+        )
 
 
-def get_stats() -> dict:
-    """Get dashboard statistics."""
+def rows_needing_llm_score(limit: int = 200) -> list[tuple[int, str, str]]:
+    """(id, author, content) for posts the LLM has not judged yet."""
     conn = get_db_connection()
     if conn is None:
-        return {"total_posts": 0, "hiring_posts": 0, "total_notifications": 0,
-                "total_runs": 0, "unique_locations": 0}
+        return []
+    with closing(conn):
+        rows = conn.execute(
+            "SELECT id, COALESCE(author_name,''), COALESCE(content,'') FROM posts "
+            "WHERE COALESCE(scored_by,'rules') != 'gemini' "
+            "ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [(int(r[0]), r[1], r[2]) for r in rows]
 
-    cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM posts")
-    total_posts = cursor.fetchone()[0]
+def save_llm_verdict(post_id: int, verdict, threshold: int) -> None:
+    """Persist one Gemini verdict, keeping the original rule score."""
+    score = min(verdict.score, 20) if not verdict.is_hiring else verdict.score
+    with closing(Database(config.DATABASE_PATH)) as db:
+        db.init_db()
+        db.conn.execute(
+            "UPDATE posts SET rule_score = COALESCE(NULLIF(rule_score,0), relevance_score), "
+            "relevance_score = ?, scored_by = 'gemini', filter_reason = ?, "
+            "is_hiring = ?, role = COALESCE(NULLIF(?,''), role) WHERE id = ?",
+            (score, f"gemini: {verdict.reason}", int(score >= threshold),
+             verdict.role, post_id),
+        )
+        db.conn.commit()
 
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE is_hiring = 1")
-    hiring_posts = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM run_log")
-    total_runs = cursor.fetchone()[0]
+def latest_run_id() -> int:
+    """Highest run_log id, used to isolate the posts a new run produces."""
+    conn = get_db_connection()
+    if conn is None:
+        return 0
+    with closing(conn):
+        row = conn.execute("SELECT MAX(id) FROM run_log").fetchone()
+    return int(row[0] or 0)
 
-    cursor.execute("SELECT locations FROM posts WHERE locations IS NOT NULL AND locations != '[]'")
-    all_locations = set()
-    for row in cursor.fetchall():
-        try:
-            locs = json.loads(row[0])
-            all_locations.update(locs)
-        except (json.JSONDecodeError, TypeError):
-            pass
 
-    conn.close()
-
+@st.cache_data(ttl=30, show_spinner=False)
+def get_stats() -> dict:
+    """Headline counters for the stat row."""
+    empty = {"total_posts": 0, "hiring_posts": 0, "total_runs": 0,
+             "unique_locations": 0, "saved": 0, "applied": 0}
+    conn = get_db_connection()
+    if conn is None:
+        return empty
+    with closing(conn):
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM posts")
+        total_posts = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM posts WHERE is_hiring = 1")
+        hiring_posts = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM run_log")
+        total_runs = cur.fetchone()[0]
+        cur.execute("SELECT COALESCE(status,'new'), COUNT(*) FROM posts GROUP BY 1")
+        by_status = dict(cur.fetchall())
+        cur.execute("SELECT locations FROM posts WHERE locations IS NOT NULL AND locations != '[]'")
+        found = set()
+        for row in cur.fetchall():
+            found.update(C.parse_json_list(row[0]))
     return {
         "total_posts": total_posts,
         "hiring_posts": hiring_posts,
         "total_runs": total_runs,
-        "unique_locations": len(all_locations),
+        "unique_locations": len(found),
+        "saved": int(by_status.get("saved", 0)),
+        "applied": int(by_status.get("applied", 0)),
     }
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def get_found_locations() -> list[str]:
-    """Get unique locations that have been found in posts."""
+    counts = get_location_counts()
+    return sorted(counts)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_location_counts() -> dict[str, int]:
     conn = get_db_connection()
     if conn is None:
-        return []
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT locations FROM posts WHERE locations IS NOT NULL AND locations != '[]'")
-    all_locations = set()
-    for row in cursor.fetchall():
-        try:
-            locs = json.loads(row[0])
-            all_locations.update(locs)
-        except (json.JSONDecodeError, TypeError):
-            pass
-    conn.close()
-    return sorted(all_locations)
+        return {}
+    counts: dict[str, int] = {}
+    with closing(conn):
+        rows = conn.execute(
+            "SELECT locations FROM posts WHERE locations IS NOT NULL AND locations != '[]'"
+        ).fetchall()
+    for row in rows:
+        for loc in C.parse_json_list(row[0]):
+            counts[loc] = counts.get(loc, 0) + 1
+    return counts
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def get_top_skills(limit: int = 15) -> list[tuple[str, int]]:
-    """Get the most frequently mentioned skills."""
     conn = get_db_connection()
     if conn is None:
         return []
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT skills FROM posts WHERE skills IS NOT NULL AND skills != '[]'")
-    skill_counts: dict[str, int] = {}
-    for row in cursor.fetchall():
-        try:
-            skills = json.loads(row[0])
-            for s in skills:
-                skill_counts[s] = skill_counts.get(s, 0) + 1
-        except (json.JSONDecodeError, TypeError):
-            pass
-    conn.close()
-
-    sorted_skills = sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)
-    return sorted_skills[:limit]
+    counts: dict[str, int] = {}
+    with closing(conn):
+        rows = conn.execute(
+            "SELECT skills FROM posts WHERE skills IS NOT NULL AND skills != '[]'"
+        ).fetchall()
+    for row in rows:
+        for skill in C.parse_json_list(row[0]):
+            counts[skill] = counts.get(skill, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def get_keywords() -> list[dict]:
-    """Get all keywords with their status."""
     conn = get_db_connection()
     if conn is None:
         return []
-
-    cursor = conn.cursor()
-    cursor.execute("SELECT keyword, active FROM keywords ORDER BY keyword")
-    keywords = [{"keyword": row[0], "active": bool(row[1])} for row in cursor.fetchall()]
-    conn.close()
-    return keywords
+    with closing(conn):
+        rows = conn.execute("SELECT keyword, active FROM keywords ORDER BY keyword").fetchall()
+    return [{"keyword": r[0], "active": bool(r[1])} for r in rows]
 
 
 # ---------------------------------------------------------------------------
-# Scraper runner (background thread)
+# Location catalogue (base list + anything the user adds at runtime)
 # ---------------------------------------------------------------------------
 
-def run_scraper_in_background(url: str = "",
-                              filter_locations: list[str] | None = None,
-                              filter_experience: tuple[int, int] | None = None):
-    """Run the scraper pipeline in a background thread."""
-    if st.session_state.get("scraper_running", False):
-        return
+BASE_LOCATIONS = list(dict.fromkeys(
+    list(config.TARGET_LOCATIONS) + ["India"] + list(getattr(config, "OTHER_LOCATIONS", []))[:12]
+))
 
-    st.session_state["scraper_running"] = True
-    st.session_state["scraper_log"] = []
-    st.session_state["scraper_start_time"] = datetime.now()
 
-    # Record the max run_id before we start, so we can isolate new posts
-    conn = get_db_connection()
-    if conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT MAX(id) FROM run_log")
-            max_id = cursor.fetchone()[0] or 0
-        except Exception:
-            max_id = 0
-        conn.close()
-    else:
-        max_id = 0
-    st.session_state["last_run_id"] = max_id
+def all_locations() -> list[str]:
+    """Base catalogue plus custom locations, which persist across reruns.
 
-    def _run():
-        try:
-            import asyncio
-            import sys
-            from main import run_pipeline, setup_logging
-            setup_logging()
+    The previous version appended to a module-level list, which Streamlit
+    rebuilt on every rerun - so a custom location vanished immediately.
+    """
+    custom = st.session_state.setdefault("custom_locations", [])
+    return list(dict.fromkeys(BASE_LOCATIONS + custom))
 
-            # On Windows, the default SelectorEventLoop in a thread doesn't
-            # support subprocesses (required by Playwright).  Force Proactor.
-            if sys.platform == "win32":
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            stats = loop.run_until_complete(run_pipeline(
-                dry_run=False,
-                url=url,
-                filter_locations=filter_locations,
-                filter_experience=filter_experience,
-            ))
-            loop.close()
+def selected_locations() -> list[str]:
+    """Locations currently ticked in the sidebar editor."""
+    return [loc for loc in all_locations() if st.session_state.get(f"loc_{loc}", True)]
 
-            st.session_state["scraper_last_stats"] = {
-                "posts_found": stats.posts_found,
-                "duplicates_removed": stats.duplicates_removed,
-                "filtered_out": stats.filtered_out,
-                "new_posts": stats.new_posts,
-                "duration": stats.duration_seconds,
-                "errors": stats.errors,
-                "url_used": url,
-            }
-        except Exception as e:
-            st.session_state["scraper_last_stats"] = {
-                "posts_found": 0,
-                "duplicates_removed": 0,
-                "filtered_out": 0,
-                "new_posts": 0,
-                "duration": 0,
-                "errors": [str(e)],
-                "url_used": url,
-            }
-        finally:
-            st.session_state["scraper_running"] = False
 
-    thread = threading.Thread(target=_run, daemon=True)
+# ---------------------------------------------------------------------------
+# Card data extraction
+# ---------------------------------------------------------------------------
+
+def _detect_platform(url: str) -> str:
+    if not url:
+        return ""
+    lowered = url.lower()
+    for domain, name in config.ATS_PLATFORMS.items():
+        if domain in lowered:
+            return name
+    return ""
+
+
+def _clean(value, fallback=""):
+    """Row value with pandas NaN collapsed to *fallback*."""
     try:
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        add_script_run_ctx(thread)
-    except ImportError:
+        if value is None or pd.isna(value):
+            return fallback
+    except (TypeError, ValueError):
         pass
-    thread.start()
+    return value if value not in ("", None) else fallback
+
+
+def card_data(row) -> dict:
+    """Flatten one posts row into the plain dict `ui.components.job_card` wants."""
+    role = _clean(row.get("role")) or _clean(row.get("keyword_matched")) or "Job opportunity"
+
+    locations = C.parse_json_list(row.get("locations"))
+    primary_url = _clean(row.get("primary_url"))
+    extra_urls = C.parse_json_list(row.get("extracted_urls"))
+
+    # Older rows predate primary_url/extracted_urls and only have apply_links.
+    if not primary_url and not extra_urls:
+        legacy = C.parse_json_list(row.get("apply_links"))
+        if legacy:
+            primary_url, extra_urls = legacy[0], legacy[1:]
+
+    posted_at = _clean(row.get("posted_at"))
+    created_at = _clean(row.get("created_at"))
+    stamp = posted_at or created_at
+    when = C.relative_time(stamp)
+    if posted_at:
+        when = when or C.format_timestamp(posted_at)
+    elif when:
+        when = f"found {when}"
+
+    content = _clean(row.get("content"))
+    author_url = _clean(row.get("author_url"))
+    # Rows scraped while the author selectors were stale have an empty
+    # author_name; recover it from the post structure instead of showing
+    # every card as "Unknown".
+    author = resolve_author_name(str(_clean(row.get("author_name"))),
+                                 str(content), str(author_url))
+    headline = resolve_author_headline(str(_clean(row.get("author_headline"))),
+                                       str(content), author)
+
+    platform = _detect_platform(str(primary_url))
+    return {
+        "id": int(_clean(row.get("id"), 0) or 0),
+        "role": role,
+        "author": author or "Unknown",
+        "headline": headline,
+        "author_url": author_url,
+        "post_url": _clean(row.get("post_url")),
+        "location": ", ".join(locations[:3]) if locations else "",
+        "experience": C.format_experience(row.get("experience_min"), row.get("experience_max")),
+        "when": when,
+        "when_exact": C.format_timestamp(stamp),
+        "platform": f"LinkedIn + {platform}" if platform else "LinkedIn",
+        "skills": C.parse_json_list(row.get("skills")),
+        "emails": C.parse_json_list(row.get("emails")),
+        "primary_url": primary_url,
+        "extra_urls": extra_urls,
+        "content": content,
+        "score": int(_clean(row.get("relevance_score"), 0) or 0),
+        "status": _clean(row.get("status")) or "new",
+        "scored_by": _clean(row.get("scored_by")) or "rules",
+        "rule_score": int(_clean(row.get("rule_score"), 0) or 0),
+        "filter_reason": _clean(row.get("filter_reason")),
+    }
 
 
 # ---------------------------------------------------------------------------
-# UI Components
+# UI — masthead and run console
 # ---------------------------------------------------------------------------
 
-def render_header():
-    """Render the main dashboard header."""
-    st.markdown("""
-    <div class="main-header">
-        <h1>🔍 LinkedIn Job Monitor</h1>
-        <p>Automated discovery of AI, GenAI, LLM & RAG hiring opportunities from LinkedIn Posts</p>
-    </div>
-    """, unsafe_allow_html=True)
+def render_masthead() -> None:
+    stats = get_stats()
+    running = runner.is_running()
+    subtitle = "Automated discovery of AI, GenAI, LLM & RAG hiring posts on LinkedIn"
+    pill = f"{stats['hiring_posts']} live roles" if stats["hiring_posts"] else ""
+    st.markdown(C.masthead(running, subtitle, pill), unsafe_allow_html=True)
 
 
-def render_url_input():
-    """Render the LinkedIn URL input section in the main area."""
+@st.fragment(run_every=1.5)
+def _live_progress() -> None:
+    """Poll the runner while a scrape is in flight.
 
-    is_running = st.session_state.get("scraper_running", False)
+    Replaces the old `<meta http-equiv="refresh">`, which reloaded the whole
+    page and destroyed the session (and with it the run state).
+    """
+    if not runner.is_running():
+        st.rerun()  # full-app rerun so the finished results render
+        return
+    elapsed = runner.elapsed_seconds()
+    st.markdown(
+        f'<div class="hl-chip hl-chip-accent">⏳ Scraping LinkedIn — '
+        f'{int(elapsed)}s elapsed</div><div class="hl-progress"></div>',
+        unsafe_allow_html=True,
+    )
 
-    col_url, col_btn = st.columns([4, 1])
 
+def render_run_console(f: Filters) -> None:
+    """URL box, run button, and the outcome of the last run."""
+    running = runner.is_running()
+
+    col_url, col_btn = st.columns([4, 1], vertical_alignment="bottom")
     with col_url:
         url = st.text_input(
-            "🔗 Paste LinkedIn Search URL",
-            value=st.session_state.get("last_url", ""),
-            placeholder="Enter the URL here...",
-            help="Go to LinkedIn → Search → Posts tab → Copy the URL from your browser and paste it here",
-            label_visibility="visible",
+            "LinkedIn search URL",
+            placeholder="https://www.linkedin.com/search/results/content/?keywords=...",
+            help="LinkedIn → search your keywords → open the **Posts** tab → copy the URL.",
             key="linkedin_url_input",
         )
-
     with col_btn:
-        st.markdown("<br>", unsafe_allow_html=True)  # Align button with input
-        run_clicked = st.button(
-            "🚀 Run Scraper" if not is_running else "⏳ Running...",
-            disabled=is_running,
-            use_container_width=True,
-            type="primary",
+        clicked = st.button(
+            "⏳ Running…" if running else "🚀 Run scraper",
+            disabled=running, width="stretch", type="primary",
             key="run_scraper_btn",
         )
 
-    if run_clicked and url.strip():
-        st.session_state["last_url"] = url.strip()
-        # Pass sidebar filter selections to the scraper pipeline
-        sel_locs = st.session_state.get("selected_locations")
-        sel_exp = st.session_state.get("filter_experience_range")
-        run_scraper_in_background(
-            url=url.strip(),
-            filter_locations=sel_locs,
-            filter_experience=sel_exp,
-        )
-        st.rerun()
-    elif run_clicked and not url.strip():
-        st.warning("⚠️ Please paste a LinkedIn search URL first.")
-
-    # Show running status
-    if is_running:
-        st.info("⏳ **Scraper is running...** A browser window is open scraping LinkedIn. This page will update with results when it finishes.")
-        st.markdown('<meta http-equiv="refresh" content="5">', unsafe_allow_html=True)
-
-    # Last run results
-    last_stats = st.session_state.get("scraper_last_stats")
-    if last_stats and not is_running:
-        cols = st.columns(5)
-        with cols[0]:
-            st.metric("📄 Scraped", last_stats.get("posts_found", 0))
-        with cols[1]:
-            st.metric("♻️ Duplicates", last_stats.get("duplicates_removed", 0),
-                      help="Already-seen posts skipped by deduplication")
-        with cols[2]:
-            st.metric("🚫 Filtered Out", last_stats.get("filtered_out", 0),
-                      help="New posts that did not pass the AI/location/experience filters")
-        with cols[3]:
-            st.metric("🆕 New", last_stats.get("new_posts", 0),
-                      help="Relevant posts that passed all filters")
-        with cols[4]:
-            st.metric("⏱ Duration", f"{last_stats.get('duration', 0):.0f}s")
-        if last_stats.get("errors"):
-            for err in last_stats["errors"][:3]:
-                st.error(f"❌ {err[:150]}")
-
-    return url
-
-
-def render_metrics():
-    """Render the top-level metric cards."""
-    stats = get_stats()
-
-    cols = st.columns(4)
-    metrics = [
-        ("📄", str(stats["total_posts"]), "Total Posts", "blue"),
-        ("🎯", str(stats["hiring_posts"]), "Hiring Posts", "purple"),
-        ("🔄", str(stats["total_runs"]), "Total Runs", "orange"),
-        ("📍", str(stats["unique_locations"]), "Locations", "cyan"),
-    ]
-
-    for col, (icon, value, label, color) in zip(cols, metrics):
-        with col:
-            st.markdown(f"""
-            <div class="metric-card">
-                <div style="font-size: 1.3rem; margin-bottom: 0.4rem;">{icon}</div>
-                <div class="metric-value {color}">{value}</div>
-                <div class="metric-label">{label}</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-
-def render_job_card(row):
-    """Render a single job posting card with the new layout order:
-    1. Apply Link  2. Company Website  3. Job Title  4. Company Name
-    5. Location  6. Date Posted  7. Source Platform  8. View Source Post
-    """
-    # --- Extract data from row ---
-    role = row.get("role", "")
-    if pd.isna(role) or not role:
-        kw = row.get("keyword_matched", "")
-        role = kw if kw and not pd.isna(kw) else "Job Opportunity"
-        
-    author = row.get("author_name", "")
-    if pd.isna(author) or not author:
-        author = "Unknown"
-        
-    content = row.get("content", "")
-    if pd.isna(content):
-        content = ""
-        
-    post_url = row.get("post_url", "")
-    if pd.isna(post_url):
-        post_url = ""
-
-    company_url = row.get("company_url", "")
-    if pd.isna(company_url):
-        company_url = ""
-
-    created_at = row.get("created_at", "")
-
-    # --- NO fake URL reconstruction --- just use what's stored
-
-    # --- Parse locations ---
-    locations_str = "Not Specified"
-    try:
-        locs = json.loads(row.get("locations", "[]") or "[]")
-        if locs:
-            locations_str = ", ".join(locs)
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # --- Parse skills ---
-    skills_html = ""
-    try:
-        skills = json.loads(row.get("skills", "[]") or "[]")
-        if skills:
-            tags = "".join(f'<span class="skill-tag">{s}</span>' for s in skills[:10])
-            skills_html = f'<div class="job-skills">{tags}</div>'
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # --- Parse emails ---
-    emails_html = ""
-    try:
-        emails = json.loads(row.get("emails", "[]") or "[]")
-        if emails:
-            tags = "".join(
-                f'<span style="display:inline-block;margin-right:0.4rem;margin-top:0.3rem;'
-                f'padding:0.2rem 0.6rem;background:rgba(245,158,11,0.1);color:var(--accent-orange);'
-                f'border:1px solid rgba(245,158,11,0.3);border-radius:8px;font-size:0.78rem;'
-                f'font-weight:500;">{e}</span>'
-                for e in emails
-            )
-            emails_html = f'<div style="margin-top:0.4rem;">{tags}</div>'
-    except (json.JSONDecodeError, TypeError, KeyError):
-        pass
-
-    # --- Parse URLs ---
-    primary_url = row.get("primary_url")
-    if pd.isna(primary_url):
-        primary_url = None
-        
-    extracted_urls = []
-    try:
-        urls_val = row.get("extracted_urls", "[]")
-        if pd.notna(urls_val):
-            extracted_urls = json.loads(urls_val or "[]")
-    except (json.JSONDecodeError, TypeError, KeyError):
-        pass
-
-    # Fallback to apply_links column for old DB records
-    if not primary_url and not extracted_urls:
-        try:
-            old_apply = json.loads(row.get("apply_links", "[]") or "[]")
-            if old_apply:
-                primary_url = old_apply[0]
-                extracted_urls = old_apply[1:]
-        except (json.JSONDecodeError, TypeError, KeyError):
-            pass
-
-    # --- Detect platform from primary url ---
-    def _detect_platform(url: str) -> str:
-        if not url: return ""
-        url_lower = url.lower()
-        platform_map = {
-            'greenhouse.io': 'Greenhouse',
-            'lever.co': 'Lever',
-            'workday.com': 'Workday',
-            'myworkday.com': 'Workday',
-            'ashbyhq.com': 'Ashby',
-            'smartrecruiters.com': 'SmartRecruiters',
-            'icims.com': 'iCIMS',
-            'taleo.net': 'Taleo',
-            'breezy.hr': 'Breezy',
-            'recruitee.com': 'Recruitee',
-            'bamboohr.com': 'BambooHR',
-            'jazz.co': 'JazzHR',
-            'jobs.lever.co': 'Lever',
-            'indeed.com': 'Indeed',
-            'naukri.com': 'Naukri'
-        }
-        for domain, name in platform_map.items():
-            if domain in url_lower:
-                return name
-        return ""
-
-    detected_platform = _detect_platform(primary_url) if primary_url else ""
-
-    # --- Build Apply Section HTML (top of card) ---
-    apply_section_html = ""
-    if primary_url or extracted_urls:
-        links_html = '<div class="apply-section"><div class="apply-section-label">🚀 Action Required</div><div style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem;">'
-        if primary_url:
-            primary_domain = urlparse(primary_url).netloc.replace("www.", "")
-            links_html += f'<a href="{primary_url}" target="_blank" class="apply-link" style="display:inline-block;">✨ Primary Link → <span style="font-size:0.75rem;opacity:0.8;margin-left:0.3rem;">{primary_domain[:25]}</span></a>'
-        if extracted_urls:
-            # Always show first link directly
-            first_link = extracted_urls[0]
-            first_domain = urlparse(first_link).netloc.replace("www.", "")
-            links_html += f'<div style="display:flex; flex-wrap:wrap; gap:0.4rem; align-items:center;">'
-            links_html += f'<a href="{first_link}" target="_blank" style="font-size:0.8rem; background:rgba(79,140,255,0.1); border:1px solid rgba(79,140,255,0.2); padding:0.25rem 0.6rem; border-radius:6px; color:var(--accent-blue); text-decoration:none; font-weight:500;">📎 {first_domain[:20]}</a>'
-            if len(extracted_urls) > 1:
-                links_html += f'<span style="font-size:0.75rem;color:var(--text-muted);cursor:pointer;" title="{len(extracted_urls)-1} more links below">+{len(extracted_urls)-1} more</span>'
-            links_html += '</div>'
-            # Show remaining links in a collapsible area
-            if len(extracted_urls) > 1:
-                links_html += '<div style="margin-top:0.4rem; padding:0.5rem; background:rgba(0,0,0,0.15); border-radius:6px; display:flex; flex-wrap:wrap; gap:0.3rem;">'
-                for link in extracted_urls[1:8]:
-                    domain = urlparse(link).netloc.replace("www.", "")
-                    links_html += f'<a href="{link}" target="_blank" style="font-size:0.75rem; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); padding:0.2rem 0.5rem; border-radius:4px; color:var(--text-secondary); text-decoration:none;">🔗 {domain[:18]}</a>'
-                links_html += '</div>'
-        links_html += '</div></div>'
-        apply_section_html = links_html
-    else:
-        apply_section_html = f'''<div class="apply-section" style="background: rgba(245,158,11,0.05); border-color: rgba(245,158,11,0.2);">
-<div class="apply-section-label" style="color: var(--accent-orange);">⚠️ No Apply Link Found</div>
-<div class="no-link-message" style="margin-top: 0.3rem;">Please check for email IDs in the post content below for manual application.</div>
-</div>'''
-
-    # --- Experience ---
-    exp_min = row.get("experience_min")
-    exp_max = row.get("experience_max")
-    if pd.isna(exp_min): exp_min = None
-    if pd.isna(exp_max): exp_max = None
-    if exp_min is not None and exp_max is not None:
-        exp_str = f"{int(exp_min)}-{int(exp_max)} Years"
-    elif exp_min is not None:
-        exp_str = f"{int(exp_min)}+ Years"
-    elif exp_max is not None:
-        exp_str = f"0-{int(exp_max)} Years"
-    else:
-        exp_str = "Not Specified"
-
-    # --- Content preview ---
-    safe_content = content.strip().replace("<", "&lt;").replace(">", "&gt;").replace("`", "'").replace("\n", "<br>")
-    content_html = f'<div class="job-content-preview">{safe_content}</div>'
-
-    # --- Format timestamp ---
-    time_display = ""
-    if created_at:
-        try:
-            dt = datetime.fromisoformat(str(created_at))
-            time_display = dt.strftime("%b %d, %Y  %I:%M:%S %p")
-        except (ValueError, TypeError):
-            time_display = str(created_at)[:19]
-
-    # --- Author headline ---
-    author_headline = row.get("author_headline", "")
-    if pd.isna(author_headline):
-        author_headline = ""
-
-    # --- Platform badge ---
-    source_platform = "LinkedIn"
-    if detected_platform:
-        source_platform = f"LinkedIn + {detected_platform}"
-    platform_html = f'<span class="platform-badge">📡 {source_platform}</span>'
-
-    # --- Source post link (Author Profile) ---
-    author_url = row.get("author_url", "")
-    if pd.isna(author_url):
-        author_url = ""
-        
-    post_urn = row.get("post_urn", "")
-    if pd.isna(post_urn):
-        post_urn = ""
-
-    # Build source section using ONLY the extracted author URL
-    source_parts = []
-
-    if author_url:
-        source_parts.append(f'''
-        <div style="background:rgba(168,85,247,0.08); border:1px solid rgba(168,85,247,0.2); border-radius:10px; padding:0.6rem 0.8rem; margin-bottom:0.5rem;">
-            <div style="font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--accent-purple); margin-bottom:0.3rem;">🔍 Verify Source</div>
-            <a href="{author_url}" target="_blank" style="display:inline-flex; align-items:center; gap:0.4rem; padding:0.35rem 0.8rem; background:rgba(168,85,247,0.15); color:var(--accent-purple); border:1px solid rgba(168,85,247,0.3); border-radius:8px; text-decoration:none; font-weight:600; font-size:0.82rem; transition:all 0.25s ease;">🔗 View Source Page →</a>
-            <div style="font-size:0.72rem; color:var(--text-muted); margin-top:0.3rem; word-break:break-all;">{author_url}</div>
-        </div>''')
-
-    source_link_html = "<div style='margin-top: 0.6rem; padding-top:0.5rem; border-top:1px solid rgba(255,255,255,0.06);'>" + "".join(source_parts) + "</div>" if source_parts else ""
-
-    # --- Render the card ---
-    st.markdown(f"""<div class="job-card">
-{apply_section_html}
-<div class="job-title">📋 {role}</div>
-<div class="job-meta">
-<span class="job-meta-item">🏢 {author}</span>
-<span class="job-meta-item">📍 {locations_str}</span>
-<span class="job-meta-item">🕐 {time_display}</span>
-<span class="job-meta-item">🎯 {exp_str}</span>
-</div>
-<div style="margin-top:0.4rem;">{platform_html}</div>
-{skills_html}{emails_html}
-{content_html}
-{source_link_html}
-</div>""", unsafe_allow_html=True)
-
-
-def render_sidebar():
-    """Render the sidebar with filters, locations, and keywords."""
-    with st.sidebar:
-        # --- Status ---
-        is_running = st.session_state.get("scraper_running", False)
-        if is_running:
-            st.markdown('<div style="text-align:center;"><span class="status-badge status-running">● SCRAPER RUNNING</span></div>',
-                        unsafe_allow_html=True)
+    if clicked:
+        cleaned = (url or "").strip()
+        if not cleaned:
+            st.warning("Paste a LinkedIn **Posts** search URL first.")
+        elif not C.is_linkedin_search_url(cleaned):
+            # Previously any string was handed straight to Playwright.
+            st.error("That does not look like a LinkedIn URL. It should start with "
+                     "`https://www.linkedin.com/`.")
         else:
-            st.markdown('<div style="text-align:center;"><span class="status-badge status-idle">○ IDLE</span></div>',
+            started = runner.start(
+                url=cleaned,
+                since_run_id=latest_run_id(),
+                filter_locations=selected_locations(),
+                filter_experience=f.exp_range,
+            )
+            if started:
+                st.rerun()
+            else:
+                st.info("A scrape is already running.")
+
+    if running:
+        _live_progress()
+        st.info("A browser window is open and scrolling LinkedIn. "
+                "This panel updates on its own — leave the tab open.")
+        return
+
+    snap = runner.snapshot()
+    if snap["error"]:
+        st.error(f"The run failed — {snap['error']}")
+        return
+
+    stats = snap["stats"]
+    if not stats:
+        return
+
+    cols = st.columns(5)
+    tiles = [
+        ("📄", stats.get("posts_found", 0), "Scraped", "rgba(109,140,255,.35)"),
+        ("♻️", stats.get("duplicates_removed", 0), "Duplicates", "rgba(160,107,255,.3)"),
+        ("🚫", stats.get("filtered_out", 0), "Filtered out", "rgba(255,182,72,.3)"),
+        ("🆕", stats.get("new_posts", 0), "New posts", "rgba(56,211,159,.35)"),
+        ("⏱", f"{stats.get('duration', 0):.0f}s", "Duration", "rgba(61,219,217,.3)"),
+    ]
+    peak = max([t[1] for t in tiles[:4] if isinstance(t[1], int)] + [1])
+    for col, (icon, value, label, tint) in zip(cols, tiles):
+        fill = int(value / peak * 100) if isinstance(value, int) else 60
+        with col:
+            st.markdown(C.stat_tile(icon, value, label, 0, fill, tint), unsafe_allow_html=True)
+
+    if stats.get("blocked"):
+        st.error("🚫 LinkedIn challenged this run. Open the browser profile, clear the "
+                 "security check, and wait a while before running again.")
+    for err in (stats.get("errors") or [])[:3]:
+        st.warning(f"⚠️ {str(err)[:200]}")
+    if stats.get("notified"):
+        st.caption(f"📨 {stats['notified']} post(s) sent to Telegram.")
+
+
+def render_stat_row() -> None:
+    stats = get_stats()
+    total = max(stats["total_posts"], 1)
+    tiles = [
+        ("📄", stats["total_posts"], "Posts captured", 100, "rgba(109,140,255,.35)", ""),
+        ("🎯", stats["hiring_posts"], "Hiring posts",
+         int(stats["hiring_posts"] / total * 100), "rgba(160,107,255,.32)",
+         f"{int(stats['hiring_posts'] / total * 100)}% of total"),
+        ("⭐", stats["saved"] + stats["applied"], "Saved / applied",
+         int((stats["saved"] + stats["applied"]) / total * 100), "rgba(56,211,159,.32)",
+         f"{stats['applied']} applied"),
+        ("📍", stats["unique_locations"], "Locations seen", 70, "rgba(61,219,217,.3)",
+         f"{stats['total_runs']} runs"),
+    ]
+    for i, (col, (icon, value, label, fill, tint, delta)) in enumerate(zip(st.columns(4), tiles)):
+        with col:
+            st.markdown(C.stat_tile(icon, value, label, i, fill, tint, delta),
                         unsafe_allow_html=True)
 
-        st.markdown("---")
 
-        # --- Search & Filters ---
-        st.markdown("### 🔍 Filters")
+# ---------------------------------------------------------------------------
+# UI — job cards
+# ---------------------------------------------------------------------------
 
+def render_job_card(row, key_suffix: str = "all", index: int = 0) -> None:
+    """One post card plus its workflow controls."""
+    data = card_data(row)
+    st.markdown(C.job_card(data, index), unsafe_allow_html=True)
+
+    post_id = data["id"]
+    if not post_id:
+        return
+
+    status = data["status"]
+    with st.expander("Score breakdown · full post · mark this post", expanded=False):
+        if data["filter_reason"]:
+            st.caption("Why this score: " + str(data["filter_reason"]).replace(", ", "  ·  "))
+        if data["content"] and len(str(data["content"])) > 320:
+            st.text_area("Full post", value=str(data["content"]), height=220,
+                         disabled=True, key=f"full_{key_suffix}_{post_id}",
+                         label_visibility="collapsed")
+        post_url = C.safe_url(data["post_url"])
+        if post_url:
+            st.markdown(f"[Open the original post on LinkedIn ↗]({post_url})")
+
+        c1, c2, c3, c4 = st.columns(4)
+        if c1.button("⭐ Save", key=f"save_{key_suffix}_{post_id}",
+                     width="stretch", disabled=(status == "saved")):
+            set_post_status(post_id, "saved")
+            st.rerun()
+        if c2.button("✅ Applied", key=f"applied_{key_suffix}_{post_id}",
+                     width="stretch", disabled=(status == "applied")):
+            set_post_status(post_id, "applied")
+            st.rerun()
+        if c3.button("🙈 Hide", key=f"hide_{key_suffix}_{post_id}",
+                     width="stretch", disabled=(status == "hidden")):
+            set_post_status(post_id, "hidden")
+            st.rerun()
+        if c4.button("↩ Reset", key=f"reset_{key_suffix}_{post_id}",
+                     width="stretch", disabled=(status == "new")):
+            set_post_status(post_id, "new")
+            st.rerun()
+
+        reason = st.text_input(
+            "Not relevant — why? (tunes the rules)",
+            key=f"nr_reason_{key_suffix}_{post_id}",
+            placeholder="e.g. webinar promo / recruiter spam / actually a Java role",
+        )
+        if st.button("🚫 Mark not relevant", key=f"nr_{key_suffix}_{post_id}",
+                     disabled=(status == "not_relevant")):
+            set_post_status(post_id, "not_relevant", reason)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# UI — sidebar
+# ---------------------------------------------------------------------------
+
+def _side_title(icon: str, text: str) -> None:
+    st.markdown(f'<div class="hl-side-title">{icon} {C.esc(text)}</div>',
+                unsafe_allow_html=True)
+
+
+def render_sidebar() -> Filters:
+    """Draw the sidebar and return the active filter set."""
+    with st.sidebar:
+        st.markdown(
+            '<div class="hl-brand" style="margin-bottom:.9rem;">'
+            '<div class="hl-logo" style="width:34px;height:34px;flex:0 0 34px;font-size:1rem;">🔍</div>'
+            '<div><div class="hl-wordmark" style="font-size:1.1rem;">HireLens</div></div></div>',
+            unsafe_allow_html=True,
+        )
+
+        _side_title("🔎", "Search & filters")
         search_text = st.text_input(
             "Search posts",
-            placeholder="Search by role, skill, author...",
+            placeholder="python rag -senior" if fts_available() else "role, skill or author…",
+            help="Full-text search. Words are AND-ed; prefix with - to exclude."
+                 if fts_available() else None,
             key="search_filter",
         )
 
-        hiring_only = st.checkbox("Only show confident hiring posts", value=True)
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        exp_range = st.slider(
-            "Experience Range (Years)",
-            min_value=0, max_value=15, value=(0, 15),
-            help="Filter jobs based on required experience. Jobs without specified experience are always shown."
+        hiring_only = st.checkbox("Only posts above the threshold", value=True,
+                                  key="hiring_only")
+
+        saved_threshold = int(get_setting("relevance_threshold", str(config.RELEVANCE_THRESHOLD)))
+        min_score = st.slider(
+            "Minimum relevance score", 0, 100, saved_threshold, 5,
+            help="Filters this view, and is reused as the pass/fail threshold on the next scrape.",
+            key="min_score",
         )
-        # Store for use by the scraper pipeline
-        st.session_state["filter_experience_range"] = exp_range
+        if min_score != saved_threshold:
+            set_setting("relevance_threshold", min_score)
 
-        st.markdown("---")
+        status_filter = st.multiselect(
+            "Status", options=list(POST_STATUSES), default=["new", "saved", "applied"],
+            format_func=lambda v: STATUS_LABELS.get(v, v),
+            help="Hidden and not-relevant posts are tucked away by default.",
+            key="status_filter",
+        )
 
-        # Location filter from found data
-        found_locs = get_found_locations()
-        loc_options = ["All"] + found_locs
-        location_filter = st.selectbox("📍 Filter by Location", loc_options, key="loc_filter")
+        exp_range = st.slider("Experience (years)", 0, 15, (0, 15), key="exp_range",
+                              help="Posts that do not state experience are always shown.")
+
+        loc_options = ["All"] + get_found_locations()
+        location_filter = st.selectbox("Location", loc_options, key="loc_filter")
 
         max_results = st.slider("Max results", 10, 200, 50, 10, key="max_results")
+        group_by_author = st.checkbox(
+            "Group by company / recruiter", value=False, key="group_by_author",
+            help="Collapse cross-posts of one role by the same recruiter.",
+        )
 
         st.markdown("---")
 
-        # --- Editable Locations ---
-        st.markdown("### 📍 Target Locations")
-        st.caption("Select which locations to accept in filtering")
+        # --- Scoring engine --------------------------------------------------
+        _side_title("🧠", "Scoring engine")
+        configured = llm_scoring.is_configured()
+        use_llm = st.checkbox(
+            "Use Gemini to score posts", value=(get_setting("use_llm_scoring", "1") == "1"),
+            disabled=not configured, key="use_llm_scoring",
+            help="When on, Gemini judges each new post and its score replaces the "
+                 "rule engine's. The rule score is always kept alongside.",
+        )
+        set_setting("use_llm_scoring", "1" if use_llm else "0")
 
-        # Initialize selected locations in session state
-        if "selected_locations" not in st.session_state:
-            st.session_state["selected_locations"] = list(config.TARGET_LOCATIONS)
-
-        # Show locations as checkboxes in a compact expander
-        with st.expander("Edit Locations", expanded=False):
-            # Select/Deselect all
-            col_all, col_none = st.columns(2)
-            with col_all:
-                if st.button("✅ Select All", use_container_width=True, key="sel_all"):
-                    st.session_state["selected_locations"] = list(ALL_LOCATIONS)
-                    st.rerun()
-            with col_none:
-                if st.button("❌ Clear All", use_container_width=True, key="clr_all"):
-                    st.session_state["selected_locations"] = []
-                    st.rerun()
-
-            selected = []
-            for loc in ALL_LOCATIONS:
-                checked = st.checkbox(
-                    loc,
-                    value=loc in st.session_state["selected_locations"],
-                    key=f"loc_{loc}",
+        if configured and use_llm:
+            with st.expander("What am I looking for?", expanded=False):
+                st.caption(
+                    "Gemini scores every post against this. The more specific "
+                    "you are - your skills, the seniority you want, the roles "
+                    "you would turn down - the sharper the filtering."
                 )
-                if checked:
-                    selected.append(loc)
+                profile = st.text_area(
+                    "Your profile", height=140, key="candidate_profile_input",
+                    value=get_setting("candidate_profile", llm_scoring.DEFAULT_PROFILE),
+                    label_visibility="collapsed",
+                    placeholder="e.g. 3 years Python, LangChain and RAG. Want "
+                                "mid-level GenAI engineering roles in Hyderabad. "
+                                "Not interested in pure data-analyst, QA or Java roles.",
+                )
+                c_save, c_reset = st.columns(2)
+                if c_save.button("Save", width="stretch", key="save_profile"):
+                    set_setting("candidate_profile", profile.strip()
+                                or llm_scoring.DEFAULT_PROFILE)
+                    st.success("Saved - it applies to the next scrape or re-score.")
+                if c_reset.button("Reset", width="stretch", key="reset_profile"):
+                    set_setting("candidate_profile", llm_scoring.DEFAULT_PROFILE)
+                    st.rerun()
 
-            # Add custom location
-            custom_loc = st.text_input("Add custom location", placeholder="e.g., Vizag", key="custom_loc")
-            if st.button("➕ Add Location", key="add_loc_btn") and custom_loc.strip():
-                if custom_loc.strip() not in ALL_LOCATIONS:
-                    ALL_LOCATIONS.append(custom_loc.strip())
-                if custom_loc.strip() not in selected:
-                    selected.append(custom_loc.strip())
-
-            st.session_state["selected_locations"] = selected
-
-        # Show active count
-        st.caption(f"✅ {len(st.session_state['selected_locations'])} locations active")
+        if not configured:
+            st.caption("No GEMINI_API_KEY found - using the rule engine.")
+        elif use_llm:
+            ok, detail = gemini_status()
+            if ok:
+                st.caption(f"✔ Gemini reachable - {detail}")
+            else:
+                st.caption(f"⚠ {detail} - falling back to rules.")
+        else:
+            st.caption("Rule engine only.")
 
         st.markdown("---")
 
-        # --- Keywords ---
-        st.markdown("### 🔑 Keywords")
-        keywords = get_keywords()
-        active_kws = [k["keyword"] for k in keywords if k["active"]]
-        st.caption(f"{len(active_kws)} active keywords")
+        # --- Target locations ------------------------------------------------
+        _side_title("📍", "Target locations")
+        catalogue = all_locations()
+        with st.expander(f"{len(selected_locations())} of {len(catalogue)} active", expanded=False):
+            col_all, col_none = st.columns(2)
+            # Writing the widget keys directly is the only thing that works:
+            # once a checkbox has a key, Streamlit ignores its `value=`, which
+            # is why the old Select-All / Clear-All buttons did nothing.
+            if col_all.button("Select all", width="stretch", key="sel_all"):
+                for loc in catalogue:
+                    st.session_state[f"loc_{loc}"] = True
+                st.rerun()
+            if col_none.button("Clear all", width="stretch", key="clr_all"):
+                for loc in catalogue:
+                    st.session_state[f"loc_{loc}"] = False
+                st.rerun()
 
-        with st.expander("View/Edit Keywords", expanded=False):
-            for kw in keywords:
-                col_kw, col_del = st.columns([4, 1])
-                with col_kw:
-                    status = "✅" if kw["active"] else "❌"
-                    st.text(f"{status} {kw['keyword']}")
-                with col_del:
-                    if kw["active"] and st.button("🗑", key=f"del_{kw['keyword']}"):
-                        from storage.database import Database
-                        db = Database(config.DATABASE_PATH)
-                        db.init_db()
-                        db.remove_keyword(kw["keyword"])
-                        db.close()
-                        st.rerun()
+            for loc in catalogue:
+                st.checkbox(loc, value=st.session_state.get(f"loc_{loc}", True), key=f"loc_{loc}")
 
-            new_kw = st.text_input("Add keyword", placeholder="e.g., MLOps Engineer", key="new_kw")
-            if st.button("➕ Add Keyword", use_container_width=True, key="add_kw_btn") and new_kw.strip():
-                from storage.database import Database
-                db = Database(config.DATABASE_PATH)
-                db.init_db()
-                db.add_keyword(new_kw.strip())
-                db.close()
-                st.success(f"Added: {new_kw.strip()}")
+            custom_loc = st.text_input("Add a location", placeholder="e.g. Vizag", key="custom_loc")
+            if st.button("➕ Add", key="add_loc_btn", width="stretch") and custom_loc.strip():
+                name = custom_loc.strip()
+                customs = st.session_state.setdefault("custom_locations", [])
+                if name not in BASE_LOCATIONS and name not in customs:
+                    customs.append(name)
+                st.session_state[f"loc_{name}"] = True
                 st.rerun()
 
         st.markdown("---")
 
-        # --- Settings ---
-        st.markdown("### ⚙️ Settings")
-        
-        from storage.database import Database
-        db = Database(config.DATABASE_PATH)
-        db.init_db()
-        
-        current_interval = int(db.get_setting("run_interval_minutes", str(config.RUN_INTERVAL_MINUTES)))
-        new_interval = st.number_input("Scheduler Timer (minutes)", min_value=1, max_value=1440, value=current_interval, help="How often the background scheduler should run")
-        if new_interval != current_interval:
-            db.set_setting("run_interval_minutes", str(new_interval))
-            
-        current_wait = int(db.get_setting("scroll_duration_seconds", "300"))
-        new_wait = st.number_input("Scroll Duration (seconds)", min_value=30, max_value=600, value=current_wait, help="How long the browser scrolls to load posts during scraping")
-        if new_wait != current_wait:
-            db.set_setting("scroll_duration_seconds", str(new_wait))
-            
-        db.close()
+        # --- Keywords --------------------------------------------------------
+        keywords = get_keywords()
+        active = [k for k in keywords if k["active"]]
+        _side_title("🔑", f"Keywords · {len(active)} active")
+        with st.expander("Manage keywords", expanded=False):
+            for kw in keywords:
+                col_kw, col_del = st.columns([4, 1])
+                col_kw.markdown(
+                    f'<span class="hl-chip {"hl-chip-mint" if kw["active"] else ""}">'
+                    f'{C.esc(kw["keyword"])}</span>', unsafe_allow_html=True)
+                if kw["active"] and col_del.button("🗑", key=f"del_{kw['keyword']}"):
+                    with closing(Database(config.DATABASE_PATH)) as db:
+                        db.init_db()
+                        db.remove_keyword(kw["keyword"])
+                    invalidate_caches()
+                    st.rerun()
+
+            new_kw = st.text_input("Add keyword", placeholder="e.g. MLOps Engineer", key="new_kw")
+            if st.button("➕ Add keyword", width="stretch", key="add_kw_btn") and new_kw.strip():
+                with closing(Database(config.DATABASE_PATH)) as db:
+                    db.init_db()
+                    db.add_keyword(new_kw.strip())
+                invalidate_caches()
+                st.rerun()
 
         st.markdown("---")
 
-        # --- Database Info ---
-        st.markdown("### 💾 Database")
+        # --- Settings --------------------------------------------------------
+        _side_title("⚙️", "Settings")
+        with closing(Database(config.DATABASE_PATH)) as db:
+            db.init_db()
+            current_interval = int(db.get_setting("run_interval_minutes",
+                                                  str(config.RUN_INTERVAL_MINUTES)))
+            new_interval = st.number_input(
+                "Scheduler interval (minutes)", 1, 1440, current_interval,
+                help="How often the background scheduler runs.", key="run_interval",
+            )
+            if new_interval != current_interval:
+                db.set_setting("run_interval_minutes", str(new_interval))
+
+            current_wait = int(db.get_setting("scroll_duration_seconds", "300"))
+            new_wait = st.number_input(
+                "Scroll duration (seconds)", 30, 600, current_wait,
+                help="How long the browser scrolls to load posts.", key="scroll_duration",
+            )
+            if new_wait != current_wait:
+                db.set_setting("scroll_duration_seconds", str(new_wait))
+
         db_path = config.DATABASE_PATH
         if db_path.exists():
             size_mb = db_path.stat().st_size / (1024 * 1024)
-            st.caption(f"📁 {db_path.name}")
-            st.caption(f"💾 Size: {size_mb:.2f} MB")
+            st.caption(f"💾 {db_path.name} · {size_mb:.2f} MB")
         else:
             st.caption("No database yet — run the scraper first.")
 
-        # --- Auto-refresh ---
-        st.markdown("---")
-        auto_refresh = st.checkbox("🔄 Auto-refresh (30s)", value=False, key="auto_refresh")
-        if auto_refresh:
-            st.markdown('<meta http-equiv="refresh" content="30">', unsafe_allow_html=True)
+        if st.checkbox("🔄 Auto-refresh (30s)", value=False, key="auto_refresh"):
+            _auto_refresh()
 
-    return search_text, hiring_only, location_filter, max_results, exp_range
+    return Filters(
+        search_text=search_text,
+        hiring_only=hiring_only,
+        location=location_filter,
+        max_results=max_results,
+        exp_range=exp_range,
+        min_score=min_score,
+        statuses=status_filter,
+        group_by_author=group_by_author,
+    )
 
 
-def render_skills_chart():
-    """Render a bar chart of top skills."""
+@st.fragment(run_every=30)
+def _auto_refresh() -> None:
+    """Periodic full rerun, without reloading the page (and losing state)."""
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# UI — analytics and history
+# ---------------------------------------------------------------------------
+
+def render_skills_chart() -> None:
     top_skills = get_top_skills(12)
     if not top_skills:
-        st.info("No skills data yet. Run the scraper first!")
+        st.info("No skills data yet — run the scraper first.")
+        return
+    df = pd.DataFrame(top_skills, columns=["Skill", "Count"])
+    st.bar_chart(df.set_index("Skill"), horizontal=True, color=theme.ACCENT)
+
+
+def render_locations_chart() -> None:
+    counts = get_location_counts()
+    if not counts:
+        st.info("No location data yet.")
+        return
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    df = pd.DataFrame(top, columns=["Location", "Count"])
+    st.bar_chart(df.set_index("Location"), horizontal=True, color=theme.VIOLET)
+
+
+def render_score_chart() -> None:
+    """Distribution of relevance scores — shows whether the threshold is sane."""
+    conn = get_db_connection()
+    if conn is None:
+        st.info("No score data yet.")
+        return
+    with closing(conn):
+        df = pd.read_sql_query(
+            "SELECT COALESCE(relevance_score,0) AS score FROM posts", conn)
+    if df.empty:
+        st.info("No score data yet.")
+        return
+    buckets = pd.cut(df["score"], bins=[-1, 19, 39, 59, 79, 100],
+                     labels=["0-19", "20-39", "40-59", "60-79", "80-100"])
+    counts = buckets.value_counts().sort_index()
+    st.bar_chart(counts, color=theme.CYAN)
+
+
+def render_rescore_panel(f: Filters) -> None:
+    """Re-judge already-stored posts with Gemini, with live progress."""
+    if not llm_scoring.is_configured():
+        st.info("No GEMINI_API_KEY found, so stored posts keep their rule scores. "
+                "Add the key to your .env and reload to enable this.")
         return
 
-    skills_df = pd.DataFrame(top_skills, columns=["Skill", "Count"])
-    st.bar_chart(skills_df.set_index("Skill"), horizontal=True)
+    pending = rows_needing_llm_score(limit=500)
+    if not pending:
+        if get_stats()["total_posts"] == 0:
+            st.info("No posts stored yet. New posts are scored by Gemini "
+                    "automatically as they are scraped.")
+        else:
+            st.success("Every stored post has already been scored by Gemini.")
+        return
+
+    st.caption(f"{len(pending)} post(s) still carry a rule-engine score. "
+               "Re-scoring sends their text to Gemini - roughly one request "
+               f"per {llm_scoring.BATCH_SIZE} posts.")
+    how_many = st.slider("How many to re-score now", 5,
+                         min(len(pending), 200), min(len(pending), 50), 5,
+                         key="rescore_count")
+    if not st.button(f"Re-score {how_many} posts", type="primary", key="rescore_btn"):
+        return
+
+    threshold = int(get_setting("relevance_threshold", str(config.RELEVANCE_THRESHOLD)))
+    batch = pending[:how_many]
+    done = 0
+    bar = st.progress(0.0, text="Asking Gemini ...")
+    for post_id, verdict in llm_scoring.rescore_rows(
+            batch, target_locations=selected_locations(), experience_range=f.exp_range,
+            profile=get_setting("candidate_profile", llm_scoring.DEFAULT_PROFILE)):
+        save_llm_verdict(post_id, verdict, threshold)
+        done += 1
+        bar.progress(min(done / len(batch), 1.0), text=f"Re-scored {done}/{len(batch)}")
+    bar.empty()
+
+    invalidate_caches()
+    if done:
+        st.success(f"Re-scored {done} post(s) with Gemini.")
+    else:
+        st.warning("Gemini returned no verdicts - the posts keep their rule scores. "
+                   "Check the key and your connection.")
+    st.rerun()
 
 
-def render_run_history():
-    """Render recent run history."""
+def render_run_history() -> None:
     df = load_run_logs(10)
     if df.empty:
-        st.info("No run history yet. Run the scraper to see history here.")
+        st.markdown(
+            C.empty_state("No runs yet", "Run history appears here after your first scrape.",
+                          icon="&#128338;"),
+            unsafe_allow_html=True)
         return
 
-    def _num(row, col):
+    def _num(row, col) -> int:
         val = row.get(col, 0)
         try:
             if pd.isna(val):
@@ -1409,210 +1002,217 @@ def render_run_history():
             pass
         return int(val or 0)
 
-    for _, row in df.iterrows():
-        started = row.get("started_at", "N/A")
-        posts = _num(row, "posts_found")
-        dupes = _num(row, "duplicates_removed")
-        filtered = _num(row, "filtered_out")
-        new = _num(row, "new_posts")
+    for i, (_, row) in enumerate(df.iterrows()):
         errors = row.get("errors", "")
-
-        error_badge = ""
-        if errors and errors not in ("null", "[]", None, ""):
-            error_badge = " ⚠️"
-
-        st.markdown(f"""
-        <div class="run-log-entry">
-            <span>🕐 {started}</span>
-            <span>📄 {posts} scraped</span>
-            <span>♻️ {dupes} dupes</span>
-            <span>🚫 {filtered} filtered</span>
-            <span>🆕 {new} new</span>
-            <span>{error_badge}</span>
-        </div>
-        """, unsafe_allow_html=True)
+        badge = ""
+        if row.get("status") == "blocked":
+            badge = "blocked"
+        elif errors and str(errors) not in ("null", "[]", "None", "nan", ""):
+            badge = "errors"
+        st.markdown(
+            C.run_row(i, row.get("started_at"), _num(row, "posts_found"),
+                      _num(row, "duplicates_removed"), _num(row, "filtered_out"),
+                      _num(row, "new_posts"), badge),
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Main App
+# UI — post views
 # ---------------------------------------------------------------------------
 
-def main():
-    """Main Streamlit application."""
-    # Initialize database on first load
+def _render_export_buttons(df: pd.DataFrame, key_suffix: str) -> None:
+    export_df = export_frame(df)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "⬇️ CSV", data=export_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"hirelens_{key_suffix}_{stamp}.csv", mime="text/csv",
+        width="stretch", key=f"csv_{key_suffix}",
+    )
+    c2.download_button(
+        "⬇️ JSON",
+        data=export_df.to_json(orient="records", indent=2, force_ascii=False).encode("utf-8"),
+        file_name=f"hirelens_{key_suffix}_{stamp}.json", mime="application/json",
+        width="stretch", key=f"json_{key_suffix}",
+    )
+
+
+def _render_cards(df: pd.DataFrame, key_suffix: str, group_by_author: bool) -> None:
+    if not group_by_author:
+        for i, (_, row) in enumerate(df.iterrows()):
+            render_job_card(row, key_suffix, i)
+        return
+
+    index = 0
+    for author, group in df.groupby(df["author_name"].fillna("Unknown"), sort=False):
+        group = group.sort_values("relevance_score", ascending=False)
+        if len(group) == 1:
+            render_job_card(group.iloc[0], key_suffix, index)
+            index += 1
+            continue
+        st.markdown(C.group_heading(str(author), len(group)), unsafe_allow_html=True)
+        render_job_card(group.iloc[0], key_suffix, index)
+        index += 1
+        with st.expander(f"{len(group) - 1} more from {author}"):
+            for _, row in group.iloc[1:].iterrows():
+                render_job_card(row, key_suffix, 0)
+
+
+_TABLE_COLUMNS = {
+    "relevance_score": st.column_config.NumberColumn("Score", width="small"),
+    "status": st.column_config.TextColumn("Status", width="small"),
+    "primary_url": st.column_config.LinkColumn("Apply", display_text="Apply"),
+    "posted_at": st.column_config.TextColumn("Posted"),
+    "post_url": st.column_config.LinkColumn("Link", display_text="Open"),
+    "role": st.column_config.TextColumn("Role", width="medium"),
+    "author_name": st.column_config.TextColumn("Author", width="medium"),
+    "locations": st.column_config.TextColumn("Locations", width="medium"),
+    "skills": st.column_config.TextColumn("Skills", width="large"),
+    "emails": st.column_config.TextColumn("Emails", width="medium"),
+    "experience_min": st.column_config.NumberColumn("Exp min"),
+    "experience_max": st.column_config.NumberColumn("Exp max"),
+    "created_at": st.column_config.TextColumn("Found at"),
+}
+
+
+def render_posts_view(df: pd.DataFrame, key_suffix: str, f: Filters,
+                      empty_title: str, empty_body: str,
+                      steps: list[str] | None = None) -> None:
+    if df.empty:
+        st.markdown(C.empty_state(empty_title, empty_body, steps), unsafe_allow_html=True)
+        return
+
+    head, mode, export = st.columns([2, 1, 1], vertical_alignment="center")
+    with head:
+        top = int(df["relevance_score"].max()) if "relevance_score" in df else 0
+        st.markdown(C.section_heading(f"{len(df)} opportunities",
+                                      f"best match scores {top}"), unsafe_allow_html=True)
+    with mode:
+        view_mode = st.radio("View", ["Cards", "Table"], horizontal=True,
+                             label_visibility="collapsed", key=f"view_mode_{key_suffix}")
+    with export:
+        _render_export_buttons(df, key_suffix)
+
+    if view_mode == "Cards":
+        _render_cards(df, key_suffix, f.group_by_author)
+    else:
+        display = [c for c in _TABLE_COLUMNS if c in df.columns]
+        st.dataframe(df[display], width="stretch", hide_index=True,
+                     column_config=_TABLE_COLUMNS)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     ensure_db()
 
-    # Initialize session state
-    if "scraper_running" not in st.session_state:
-        st.session_state["scraper_running"] = False
+    # The sidebar is drawn first so the run console sees the current filters;
+    # previously the console ran first and handed the scraper stale (on the
+    # first load, empty) location and experience filters.
+    filters = render_sidebar()
 
-    # Header
-    render_header()
+    render_masthead()
+    render_run_console(filters)
+    st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+    render_stat_row()
+    st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 
-    # --- URL Input (prominent, at the top of main area) ---
-    render_url_input()
-
-    # Sidebar (returns filter values)
-    search_text, hiring_only, location_filter, max_results, exp_range = render_sidebar()
-
-    # Metrics row
-    render_metrics()
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Main content tabs
-    tab_new, tab_all, tab_analytics, tab_history = st.tabs([
-        "🆕 New (This Run)", "📋 All Posts", "📊 Analytics", "🕐 Run History"
+    tab_new, tab_all, tab_insights, tab_runs, tab_feedback = st.tabs([
+        "🆕 Latest run", "📋 All posts", "📊 Insights", "🕐 Runs", "🧭 Feedback",
     ])
 
-    # Helper to render a dataframe as cards or table
-    def _render_posts_view(df: pd.DataFrame, key_suffix: str):
-        if df.empty:
-            st.markdown("""
-            <div style="text-align: center; padding: 3rem 2rem;">
-                <div style="font-size: 3.5rem; margin-bottom: 1rem;">🔍</div>
-                <h3 style="color: var(--text-secondary); margin-bottom: 0.5rem;">No posts to show</h3>
-                <p style="color: var(--text-muted); max-width: 500px; margin: 0 auto;">
-                    <b>Step 1:</b> Go to LinkedIn → Search for "AI Engineer Hyderabad" → Click the <b>Posts</b> tab<br>
-                    <b>Step 2:</b> Copy the URL from your browser<br>
-                    <b>Step 3:</b> Paste it above and click <b>🚀 Run Scraper</b>
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.markdown(f"### Showing {len(df)} opportunities")
-            with col2:
-                view_mode = st.radio("View", ["Cards", "Table"], horizontal=True,
-                                     label_visibility="collapsed", key=f"view_mode_{key_suffix}")
-
-            if view_mode == "Cards":
-                for _, row in df.iterrows():
-                    render_job_card(row)
-            else:
-                display_cols = [
-                    "post_urn", "role", "author_name", "locations", "experience_min",
-                    "experience_max", "skills", "emails", "apply_links",
-                    "created_at", "post_url"
-                ]
-                available_cols = [c for c in display_cols if c in df.columns]
-                st.dataframe(
-                    df[available_cols],
-                    use_container_width=True,
-                    column_config={
-                        "post_urn": st.column_config.TextColumn("Post ID", width="small"),
-                        "post_url": st.column_config.LinkColumn("Link", display_text="Open"),
-                        "role": st.column_config.TextColumn("Role", width="medium"),
-                        "author_name": st.column_config.TextColumn("Author", width="medium"),
-                        "locations": st.column_config.TextColumn("Locations", width="medium"),
-                        "skills": st.column_config.TextColumn("Skills", width="large"),
-                        "emails": st.column_config.TextColumn("Emails", width="medium"),
-                        "apply_links": st.column_config.TextColumn("Apply Links", width="medium"),
-                        "experience_min": st.column_config.NumberColumn("Exp Min"),
-                        "experience_max": st.column_config.NumberColumn("Exp Max"),
-                        "created_at": st.column_config.TextColumn("Found At"),
-                    },
-                    hide_index=True,
-                )
-
-    # --- Tab 1: New Posts (This Run) ---
     with tab_new:
-        last_run_id = st.session_state.get("last_run_id")
-        
-        # If we have a last_run_id, we show what's new since that run.
-        # If we don't, we just show the very latest run's posts.
-        st.caption("Showing the most recently discovered opportunities.")
-        new_df = load_new_posts(
-            since_run_id=last_run_id,
-            hiring_only=hiring_only,
-            search_text=search_text,
-            location_filter=location_filter,
-            exp_range=exp_range,
+        new_df = load_new_posts(filters, since_run_id=runner.snapshot()["since_run_id"])
+        render_posts_view(
+            new_df, "new", filters,
+            "Nothing new yet",
+            "Paste a LinkedIn Posts search URL above and run the scraper — "
+            "whatever it finds lands here first.",
+            ["Search your keywords on LinkedIn",
+             "Switch to the Posts tab",
+             "Copy the URL and paste it above"],
         )
-        if not new_df.empty:
-            _render_posts_view(new_df, "new")
-        else:
-            st.info("🚀 Run the scraper to see new posts here. After each run, this tab will show only the freshly discovered posts.")
 
-    # --- Tab 2: All Posts ---
     with tab_all:
-        df = load_posts(
-            limit=max_results,
-            hiring_only=hiring_only,
-            search_text=search_text,
-            location_filter=location_filter,
-            exp_range=exp_range,
+        df = load_posts(filters)
+        render_posts_view(
+            df, "all", filters,
+            "No posts match these filters",
+            "Try lowering the minimum score, widening the experience range, "
+            "or clearing the search box.",
         )
-        _render_posts_view(df, "all")
 
-    # --- Tab 2: Analytics ---
-    with tab_analytics:
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            st.markdown("### 🛠 Top Skills Requested")
+    with tab_insights:
+        left, right = st.columns(2)
+        with left:
+            st.markdown(C.section_heading("Top skills requested",
+                                          "across every captured post"), unsafe_allow_html=True)
             render_skills_chart()
+        with right:
+            st.markdown(C.section_heading("Top locations", "by mention count"),
+                        unsafe_allow_html=True)
+            render_locations_chart()
+        st.markdown(C.section_heading("Score distribution",
+                                      "where your threshold cuts"), unsafe_allow_html=True)
+        render_score_chart()
 
-        with col_right:
-            st.markdown("### 📍 Top Locations")
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT locations FROM posts WHERE locations IS NOT NULL AND locations != '[]'")
-                loc_counts: dict[str, int] = {}
-                for row in cursor.fetchall():
-                    try:
-                        locs = json.loads(row[0])
-                        for loc in locs:
-                            loc_counts[loc] = loc_counts.get(loc, 0) + 1
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                conn.close()
+        st.markdown(C.section_heading("Re-score with Gemini",
+                                      "judge stored posts with the LLM"), unsafe_allow_html=True)
+        render_rescore_panel(filters)
 
-                if loc_counts:
-                    loc_df = pd.DataFrame(
-                        sorted(loc_counts.items(), key=lambda x: x[1], reverse=True)[:10],
-                        columns=["Location", "Count"]
-                    )
-                    st.bar_chart(loc_df.set_index("Location"), horizontal=True)
-                else:
-                    st.info("No location data yet.")
-            else:
-                st.info("No data yet.")
-
-        # Posts Over Time graph removed as requested
-
-    # --- Tab 3: Run History ---
-    with tab_history:
-        st.markdown("### 📜 Run History")
-        st.caption("All scraper runs are logged here. Data is saved to your local SQLite database.")
+    with tab_runs:
+        st.markdown(C.section_heading("Run history", "every scrape is logged locally"),
+                    unsafe_allow_html=True)
         render_run_history()
 
         run_df = load_run_logs(50)
         if not run_df.empty:
-            st.markdown("### 📊 Detailed Log")
+            st.markdown(C.section_heading("Detailed log"), unsafe_allow_html=True)
             log_cols = [
-                "started_at", "completed_at", "keywords_searched",
-                "posts_found", "duplicates_removed", "filtered_out",
-                "new_posts", "errors",
+                "started_at", "completed_at", "status", "deep_scan", "keywords_searched",
+                "posts_found", "duplicates_removed", "filtered_out", "new_posts",
+                "notified", "errors",
             ]
             available = [c for c in log_cols if c in run_df.columns]
             st.dataframe(
-                run_df[available],
-                use_container_width=True,
-                hide_index=True,
+                run_df[available], width="stretch", hide_index=True,
                 column_config={
                     "started_at": st.column_config.TextColumn("Started"),
                     "completed_at": st.column_config.TextColumn("Completed"),
                     "keywords_searched": st.column_config.NumberColumn("Keywords"),
                     "posts_found": st.column_config.NumberColumn("Scraped"),
                     "duplicates_removed": st.column_config.NumberColumn("Duplicates"),
-                    "filtered_out": st.column_config.NumberColumn("Filtered Out"),
+                    "filtered_out": st.column_config.NumberColumn("Filtered out"),
                     "new_posts": st.column_config.NumberColumn("New"),
+                    "notified": st.column_config.NumberColumn("Notified"),
+                    "status": st.column_config.TextColumn("Status", width="small"),
+                    "deep_scan": st.column_config.CheckboxColumn("Deep"),
                     "errors": st.column_config.TextColumn("Errors", width="medium"),
                 },
             )
+
+    with tab_feedback:
+        st.markdown(C.section_heading("Tuning feedback",
+                                      "turn rejections into better rules"), unsafe_allow_html=True)
+        st.caption(
+            "Marking a post **Not relevant** with a reason lands it here. Recurring phrases "
+            "are candidates for `NON_HIRING_SIGNALS` / `ABSOLUTE_REJECT_PHRASES` in "
+            "`config.py` — that is how the rule engine improves without any AI."
+        )
+        phrases = feedback_phrases()
+        if phrases:
+            st.dataframe(pd.DataFrame(phrases, columns=["Phrase", "Count"]),
+                         width="stretch", hide_index=True)
+        else:
+            st.info("No recurring phrases yet. Mark a few posts as not relevant (with a reason).")
+
+        fb_df = load_feedback(100)
+        if not fb_df.empty:
+            st.markdown(C.section_heading("Recent feedback"), unsafe_allow_html=True)
+            st.dataframe(fb_df, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":

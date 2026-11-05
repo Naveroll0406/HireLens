@@ -2,18 +2,19 @@
 LinkedIn AI Job Post Monitor — Main Pipeline
 
 Orchestrates the full workflow:
-  Scrape → Parse → Filter → Deduplicate → Notify → Log
+  Scrape → Deduplicate → Parse → Score → Store → Notify → Log
 
 Usage:
   python main.py                    # Run once
-  python main.py --dry-run          # Scrape & parse
+  python main.py --dry-run          # Scrape, parse & score; write nothing
+  python main.py --deep             # Force the 7-day lookback window
   python main.py --stats            # Show database statistics
   python main.py --add-keyword "AI"  # Add a search keyword
   python main.py --remove-keyword "AI"  # Remove a search keyword
   python main.py --list-keywords     # List active keywords
 """
 
-from __future__ import annotations 
+from __future__ import annotations
 
 import argparse
 import asyncio
@@ -26,10 +27,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
+from notifications import telegram
+from processing import llm_scoring
 from processing.dedup import Deduplicator
 from processing.filters import apply_all_filters
 from processing.parser import parse_post
-from scraper.linkedin import LinkedInScraper
+from processing.scoring import score_post
+from scraper.linkedin import BlockedError, LinkedInScraper
 from storage.database import Database
 from storage.models import FilteredPost, RunStats
 
@@ -71,46 +75,68 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _should_deep_scan(db: Database, force: bool = False) -> bool:
+    """Use the long lookback window once every DEEP_SCAN_EVERY_HOURS."""
+    if force:
+        return True
+    last = db.last_deep_scan_at()
+    if last is None:
+        return True
+    age_hours = (datetime.now() - last).total_seconds() / 3600
+    return age_hours >= config.DEEP_SCAN_EVERY_HOURS
+
+
+def _threshold_from_db(db: Database) -> int:
+    """Dashboard-configurable score threshold, falling back to config."""
+    raw = db.get_setting("relevance_threshold", "")
+    try:
+        return int(raw) if raw else config.RELEVANCE_THRESHOLD
+    except ValueError:
+        return config.RELEVANCE_THRESHOLD
+
+
 async def run_pipeline(dry_run: bool = False, url: str = "",
                        filter_locations: list[str] | None = None,
                        filter_experience: tuple[int, int] | None = None,
+                       deep: bool = False,
+                       use_llm: bool | None = None,
                        ) -> RunStats:
     """Execute the full monitor pipeline.
 
-    1. Initialize database
-    2. Load keywords (or use direct URL)
-    3. Scrape LinkedIn Posts
-    4. Parse posts (extract role, experience, location, skills)
-    5. Filter posts (hiring signal, experience, location, seniority)
-    6. Deduplicate against database
-    7. Store new posts
-    8. Log run statistics
+    1. Initialize database, load keywords (or use the direct URL)
+    2. Scrape LinkedIn Posts (24h window; 7d once a day or with --deep)
+    3. Deduplicate against the database (URN, content hash, SimHash)
+    4. Parse posts (role, experience, location, skills, links)
+    5. Score posts; those at/above the threshold are "hiring" posts
+    6. Store every new post (rejects too, for dedup and tuning)
+    7. Push the best posts to Telegram (if configured)
+    8. Log run statistics — exactly one run_log row per run
 
-    (Notifications were removed; posts are surfaced via the dashboard.)
-
-    Args:
-        dry_run: If True, scrape & parse without side effects.
-        url: If provided, scrape this URL directly instead of using keywords.
-        filter_locations: Optional list of accepted locations (overrides config).
-        filter_experience: Optional (min, max) experience range (overrides config).
-
-    Returns RunStats with the results.
+    dry_run: scrape, parse and score, but write nothing (no posts, no run_log,
+             no notifications).
+    url:     scrape this LinkedIn search URL instead of the keyword list.
+    filter_locations / filter_experience: dashboard overrides for scoring.
+    deep:    force the long lookback window.
     """
     stats = RunStats()
     db = Database(config.DATABASE_PATH)
     scraper = LinkedInScraper()
     dedup = Deduplicator(db)
+    run_id: int | None = None
 
     try:
         # --- Step 1: Initialize ---
         db.init_db()
         db.seed_default_keywords(config.DEFAULT_KEYWORDS)
+        threshold = _threshold_from_db(db)
+        if use_llm is None:
+            use_llm = db.get_setting("use_llm_scoring", "1") == "1"
+        use_llm = bool(use_llm) and llm_scoring.is_configured()
 
-        # --- Step 2: Get keywords ---
-        keywords = db.get_active_keywords()
-        if not keywords:
-            keywords = config.DEFAULT_KEYWORDS
-        stats.keywords_searched = len(keywords) if not url else 1
+        keywords = db.get_active_keywords() or list(config.DEFAULT_KEYWORDS)
+        stats.keywords_searched = 1 if url else len(keywords)
+        stats.deep_scan = bool(not url and _should_deep_scan(db, force=deep))
+        window = config.SEARCH_WINDOW_DEEP_SECONDS if stats.deep_scan else config.SEARCH_WINDOW_SECONDS
 
         logger.info("=" * 70)
         logger.info("🚀 Starting LinkedIn Monitor Run")
@@ -118,109 +144,113 @@ async def run_pipeline(dry_run: bool = False, url: str = "",
             logger.info("   Mode: Direct URL | Dry Run: %s", dry_run)
             logger.info("   URL: %s", url[:80])
         else:
-            logger.info("   Keywords: %d | Dry Run: %s", len(keywords), dry_run)
+            logger.info("   Keywords: %d | Window: %dh | Deep scan: %s | Dry Run: %s",
+                        len(keywords), window // 3600, stats.deep_scan, dry_run)
+        logger.info("   Score threshold: %d", threshold)
         logger.info("=" * 70)
 
-        # --- Step 3: Start browser and check login ---
-        await scraper.start()
+        if not dry_run:
+            run_id = db.log_run(stats)  # placeholder row; finalised in `finally`
 
+        # --- Step 2: Browser + login ---
+        await scraper.start()
         if not await scraper.ensure_logged_in():
             logger.error("Cannot proceed without LinkedIn login.")
             stats.errors.append("LinkedIn login failed")
             return stats
 
-        # --- Step 4: Scrape ---
+        # --- Step 3: Scrape ---
         if url:
-            # Direct URL mode — scrape the user-provided URL
             raw_posts = await scraper.search_direct_url(url)
         else:
-            # Keyword mode — search all active keywords
-            raw_posts = await scraper.search_all_keywords(keywords)
+            raw_posts = await scraper.search_all_keywords(keywords, window_seconds=window)
         stats.posts_found = len(raw_posts)
         logger.info("📥 Total raw posts scraped: %d", len(raw_posts))
-
         if not raw_posts:
             logger.info("No posts found. Ending run.")
-            stats.completed_at = datetime.now()
-            db.log_run(stats)
             return stats
 
-        # --- Step 5: Deduplicate ---
+        # --- Step 4: Deduplicate ---
         new_posts = dedup.filter_new_posts(raw_posts)
         stats.duplicates_removed = len(raw_posts) - len(new_posts)
-        # We don't set stats.new_posts here yet, we set it after filtering to reflect only relevant posts.
         logger.info("🆕 New (unseen) posts: %d", len(new_posts))
-
         if not new_posts:
             logger.info("No new posts. Ending run.")
-            stats.completed_at = datetime.now()
-            db.log_run(stats)
             return stats
 
-        # --- Step 6: Parse & Filter ---
-        filtered_posts: list[FilteredPost] = []
-
-        # Pre-log run to get a run_id we can tag posts with
-        stats.completed_at = datetime.now()  # temporary, will be overwritten
-        current_run_id = db.log_run(stats)
-
-        # Parse posts concurrently in worker threads. parse_post does blocking
-        # network I/O (resolving shortened URLs), so fanning it out keeps that
-        # off the asyncio event loop and runs the lookups in parallel.
+        # --- Step 5: Parse (worker threads: parse_post resolves short URLs) ---
         parsed_posts = await asyncio.gather(
             *(asyncio.to_thread(parse_post, raw) for raw in new_posts)
         )
 
+        # --- Step 6: Score + store ---
+        # The rule engine always runs, so there is a score even with no API
+        # key, no network, or a Gemini outage.
         for parsed in parsed_posts:
-            # Filter (with optional overrides from the dashboard)
+            score_post(parsed, target_locations=filter_locations,
+                       experience_range=filter_experience)
+
+        # Optional second pass: let Gemini override the scores. Never fatal -
+        # on any failure every post keeps the rule score just computed.
+        if use_llm:
+            engine, detail = llm_scoring.apply(
+                parsed_posts,
+                target_locations=filter_locations,
+                experience_range=filter_experience,
+                profile=db.get_setting("candidate_profile",
+                                       llm_scoring.DEFAULT_PROFILE),
+            )
+        else:
+            engine, detail = "rules", "LLM scoring disabled"
+            for parsed in parsed_posts:
+                parsed.rule_score = parsed.relevance_score
+                parsed.scored_by = "rules"
+        stats.scored_by = engine
+        logger.info("Scoring engine: %s (%s)", engine, detail)
+
+        filtered_posts: list[FilteredPost] = []
+        for parsed in parsed_posts:
             filtered = apply_all_filters(
                 parsed,
                 target_locations=filter_locations,
                 experience_range=filter_experience,
+                threshold=threshold,
+                rescore=False,
             )
+            # is_hiring is what the dashboard shows by default; the score and
+            # breakdown are stored alongside so rejects can be reviewed.
+            parsed.is_hiring = filtered is not None
             if filtered:
                 filtered_posts.append(filtered)
-            else:
-                # If it didn't pass our AI/Location filters, we mark it as not hiring
-                # so it is hidden by default in the dashboard, but still saved for dedup.
-                parsed.is_hiring = False
+            if not dry_run:
+                db.insert_post(parsed, run_id=run_id)
 
-            # Store ALL new posts in DB (even filtered-out ones, for dedup)
-            db.insert_post(parsed, run_id=current_run_id)
-
-        logger.info(
-            "🔍 Filtered: %d/%d posts passed all filters",
-            len(filtered_posts), len(new_posts),
-        )
-
-        # Set new_posts to the number of filtered posts for the UI
         stats.filtered_out = len(new_posts) - len(filtered_posts)
         stats.new_posts = len(filtered_posts)
+        logger.info("🔍 Scored: %d/%d posts at or above %d", len(filtered_posts), len(new_posts), threshold)
 
-        if not filtered_posts:
-            logger.info("No posts passed filters. Ending run.")
-            stats.completed_at = datetime.now()
-            # Update the run log we created earlier
-            db.conn.execute("UPDATE run_log SET new_posts = ? WHERE id = ?", (stats.new_posts, current_run_id))
-            db.conn.commit()
-            return stats
+        # --- Step 7: Notify ---
+        if filtered_posts and not dry_run:
+            stats.notified = telegram.notify_posts(filtered_posts)
 
-        # --- Step 7: Done (Notifications removed) ---
-        stats.completed_at = datetime.now()
-        # Update the run log we created earlier
-        db.conn.execute("UPDATE run_log SET new_posts = ? WHERE id = ?", (stats.new_posts, current_run_id))
-        db.conn.commit()
+    except BlockedError as e:
+        logger.error("🚫 %s", e)
+        stats.blocked = True
+        stats.errors.append(f"blocked: {e}")
 
     except Exception as e:
         logger.exception("❌ Pipeline error: %s", e)
         stats.errors.append(str(e))
 
     finally:
-        # Cleanup
         await scraper.stop()
-        stats.completed_at = stats.completed_at or datetime.now()
-        db.log_run(stats)
-        db.cleanup_old_posts(config.POST_RETENTION_DAYS)
+        stats.completed_at = datetime.now()
+        if not dry_run:
+            if run_id is None:
+                run_id = db.log_run(stats)
+            else:
+                db.update_run(run_id, stats)
+            db.cleanup_old_posts(config.POST_RETENTION_DAYS)
         db.close()
 
         logger.info("=" * 70)
@@ -248,6 +278,26 @@ def show_stats():
     print(f"  Hiring posts:           {stats['hiring_posts']}")
     print(f"  Total runs:             {stats['total_runs']}")
     print("─" * 40)
+
+
+def show_feedback():
+    """Print the most common phrases in 'not relevant' feedback reasons."""
+    db = Database(config.DATABASE_PATH)
+    db.init_db()
+    phrases = db.feedback_phrase_counts(min_count=2)
+    recent = db.get_feedback(limit=10)
+    db.close()
+
+    print("\n🧭 Feedback phrases (add recurring ones to NON_HIRING_SIGNALS / ABSOLUTE_REJECT_PHRASES)")
+    print("─" * 60)
+    if not phrases:
+        print("  No recurring phrases yet — mark posts 'Not relevant' in the dashboard with a reason.")
+    for phrase, count in phrases:
+        print(f"  {count:3d}× {phrase}")
+    if recent:
+        print("\nMost recent feedback:")
+        for fb in recent:
+            print(f"  [{fb['verdict']}] {fb['role'] or '-'} — {fb['reason'] or '(no reason)'}")
 
 
 def list_keywords():
@@ -295,7 +345,9 @@ def main():
         epilog="""
 Examples:
   python main.py                      Run monitor once
-  python main.py --dry-run            Scrape & parse without side effects
+  python main.py --dry-run            Scrape, parse & score without writing anything
+  python main.py --deep               Use the 7-day lookback window
+  python main.py --feedback           Show recurring 'not relevant' phrases for tuning
   python main.py --stats              Show database statistics
   python main.py --list-keywords      List all active search keywords
   python main.py --add-keyword "AI"   Add a search keyword
@@ -306,7 +358,17 @@ Examples:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the pipeline without inserting to the database (if needed)",
+        help="Scrape, parse and score but write nothing to the database",
+    )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Force the 7-day lookback window for this run",
+    )
+    parser.add_argument(
+        "--feedback",
+        action="store_true",
+        help="Show recurring phrases from 'not relevant' feedback (for tuning config.py)",
     )
     parser.add_argument(
         "--url",
@@ -358,8 +420,12 @@ Examples:
         remove_keyword(args.remove_keyword)
         return
 
+    if args.feedback:
+        show_feedback()
+        return
+
     # Run the main pipeline
-    stats = asyncio.run(run_pipeline(dry_run=args.dry_run, url=args.url or ""))
+    stats = asyncio.run(run_pipeline(dry_run=args.dry_run, url=args.url or "", deep=args.deep))
 
     # Exit with error code if there were errors
     if stats.errors:

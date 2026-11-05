@@ -9,21 +9,18 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Optional
 
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
-# User agents — realistic Chrome on Windows
+# User agent
 # --------------------------------------------------------------------------
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-]
+# We deliberately do NOT spoof the user agent. The bundled Chromium already
+# sends a genuine one, and a UA that names a Chrome version different from
+# the real one (visible via navigator.userAgentData / feature detection)
+# is a stronger bot signal than no spoofing at all.
 
 # --------------------------------------------------------------------------
 # Viewport sizes — common desktop resolutions
@@ -35,11 +32,6 @@ VIEWPORTS = [
     {"width": 1440, "height": 900},
     {"width": 1680, "height": 1050},
 ]
-
-
-def get_random_user_agent() -> str:
-    """Return a random realistic user agent string."""
-    return random.choice(USER_AGENTS)
 
 
 def get_random_viewport() -> dict:

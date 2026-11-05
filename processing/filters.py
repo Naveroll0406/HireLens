@@ -1,20 +1,37 @@
 """
 Post filters for the LinkedIn Job Post Monitor.
 
-Applies experience, location, seniority, and hiring-signal filters
-to parsed posts. Posts that pass all filters become notification candidates.
+The individual ``filter_by_*`` checks are still exposed (they're useful for
+explaining a post and in tests), but the pipeline no longer chains them as
+hard gates. ``apply_all_filters`` scores the post (see processing.scoring)
+and accepts it when the score clears the threshold, so one wrong regex
+lowers a score instead of silently deleting a good post.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 import config
-
+from processing.scoring import score_post
 from storage.models import FilteredPost, ParsedPost
 
 logger = logging.getLogger(__name__)
+
+_NON_AI_TITLE_RE = re.compile(
+    "|".join(r"\b" + re.escape(t.strip()) + r"\b" for t in config.NON_AI_ROLE_TITLES),
+    re.IGNORECASE,
+)
+_AI_TITLE_RE = re.compile(
+    "|".join(r"\b" + re.escape(t) + r"\b" for t in config.AI_ROLE_KEYWORDS),
+    re.IGNORECASE,
+)
+_STRONG_AI_RE = re.compile(
+    "|".join(r"\b" + re.escape(t) + r"\b" for t in config.STRONG_AI_KEYWORDS),
+    re.IGNORECASE,
+)
 
 
 def filter_by_experience(parsed: ParsedPost,
@@ -22,206 +39,120 @@ def filter_by_experience(parsed: ParsedPost,
                          user_max: int | None = None) -> tuple[bool, str]:
     """Check if the post's experience requirement overlaps with the user's range.
 
-    Rules:
-    - If no experience is mentioned → ACCEPT (don't miss opportunities)
-    - If experience overlaps with [user_min, user_max] → ACCEPT
-    - If experience is clearly above the max → REJECT
+    - No experience mentioned → ACCEPT (don't miss opportunities)
+    - Range overlaps [user_min, user_max] → ACCEPT
+    - Minimum clearly above the max → REJECT
     """
     if user_min is None:
         user_min = config.EXPERIENCE_MIN
     if user_max is None:
         user_max = config.EXPERIENCE_MAX
 
-    post_min = parsed.experience_min
-    post_max = parsed.experience_max
+    post_min, post_max = parsed.experience_min, parsed.experience_max
 
-    # No experience mentioned → accept
     if post_min is None and post_max is None:
         return (True, "No experience mentioned — accepted by default")
 
-    # Post has a range (e.g., 2-4 years)
     if post_min is not None and post_max is not None:
-        # Check overlap: post range [post_min, post_max] overlaps with [user_min, user_max]
         if post_min <= user_max and post_max >= user_min:
             return (True, f"Experience {post_min}-{post_max}y overlaps with {user_min}-{user_max}y")
-        else:
-            return (False, f"Experience {post_min}-{post_max}y outside range {user_min}-{user_max}y")
+        return (False, f"Experience {post_min}-{post_max}y outside range {user_min}-{user_max}y")
 
-    # Post has only minimum (e.g., "3+ years")
     if post_min is not None:
         if post_min <= user_max:
             return (True, f"Minimum {post_min}y within range")
-        else:
-            return (False, f"Minimum {post_min}y exceeds max {user_max}y")
+        return (False, f"Minimum {post_min}y exceeds max {user_max}y")
 
-    # Post has only maximum (rare, e.g., "up to 2 years")
-    if post_max is not None:
-        if post_max >= user_min:
-            return (True, f"Maximum {post_max}y within range")
-        else:
-            return (False, f"Maximum {post_max}y below min {user_min}y")
-
-    return (True, "Experience check passed")
+    if post_max >= user_min:
+        return (True, f"Maximum {post_max}y within range")
+    return (False, f"Maximum {post_max}y below min {user_min}y")
 
 
 def filter_by_location(parsed: ParsedPost,
                        target_locations: list[str] | None = None) -> tuple[bool, str]:
-    """Check if the post mentions any target location.
-
-    Rules:
-    - If no location is mentioned → ACCEPT (don't miss remote/unlisted)
-    - If any target location matches → ACCEPT
-    - If locations are mentioned but none match → REJECT
-    """
+    """Accept if no location is mentioned, or any mentioned location is a target."""
     if not parsed.locations:
         return (True, "No location mentioned — accepted by default")
 
     locs_to_check = target_locations if target_locations is not None else list(config.TARGET_LOCATIONS)
-    target_set = {loc.lower() for loc in locs_to_check}
-    post_locations = {loc.lower() for loc in parsed.locations}
-
-    matching = post_locations & target_set
+    matching = {loc.lower() for loc in parsed.locations} & {loc.lower() for loc in locs_to_check}
     if matching:
-        matched_str = ", ".join(matching)
-        return (True, f"Location match: {matched_str}")
-
+        return (True, f"Location match: {', '.join(sorted(matching))}")
     return (False, f"Locations {parsed.locations} not in target list")
 
 
-def filter_by_seniority(parsed: ParsedPost) -> tuple[bool, str]:
-    """Reject posts that are clearly for senior positions.
-
-    (Disabled per user request: Senior AI/ML profiles will now be accepted)
-    """
-    if not parsed.is_senior_role:
-        return (True, "Not a senior role")
-
-    return (True, "Senior AI/ML role accepted (filter disabled)")
-
-
 def filter_by_hiring_signal(parsed: ParsedPost) -> tuple[bool, str]:
-    """Check if the post is actually a hiring post vs. discussion/news.
-
-    Rules:
-    - Must have at least one hiring signal keyword
-    - Low confidence → still accept (err on the side of inclusion)
-    """
+    """Is this actually a hiring post vs. discussion/news?"""
     if parsed.is_hiring:
         return (True, f"Hiring signal detected (confidence: {parsed.hiring_confidence:.0%})")
-
     return (False, "No hiring signals detected")
 
 
 def filter_by_ai_role(parsed: ParsedPost) -> tuple[bool, str]:
-    """Check if the post is strictly for an AI/ML role, rejecting QA, Backend, etc.
+    """Is the post for an AI/ML role (as opposed to QA, Backend, Java-only ...)?
 
-    Rules:
-    - If the role contains non-AI specializations (Java, QA, Data Engineer, etc.) without explicitly mentioning AI in the role → REJECT
-    - If the extracted role matches any keyword in AI_ROLE_KEYWORDS → ACCEPT
-    - If the original search keyword (keyword_matched) is in the role or content → ACCEPT
-    - If the role is generic (Software Engineer, Developer) and content has AI skills → ACCEPT
-    - Otherwise → REJECT
+    - Non-AI title without an AI keyword in it → REJECT
+    - Title matches AI_ROLE_KEYWORDS → ACCEPT
+    - Search keyword appears in title/body → ACCEPT
+    - Generic/absent title but strong AI keyword in body → ACCEPT
     """
-    content_lower = parsed.raw.clean_content.lower() if parsed.raw.clean_content else ""
-    role_lower = parsed.role.lower() if parsed.role else ""
+    content = parsed.raw.clean_content or ""
+    role = parsed.role or ""
 
-    # 0. Explicit Kill List for Non-AI Roles (even if they mention ML in text)
-    non_ai_roles = [
-        "data engineer", "data analyst", "qa engineer", "test engineer", "automation engineer",
-        "frontend", "front-end", "backend", "back-end", "fullstack", "full-stack",
-        "devops", "cloud engineer", "system admin", "database administrator",
-        "react", "angular", "vue", "java developer", "c# developer", ".net"
-    ]
-    if any(r in role_lower for r in non_ai_roles) and not any(ai_kw.lower() in role_lower for ai_kw in config.AI_ROLE_KEYWORDS):
-        return (False, f"Role '{parsed.role}' explicitly rejected (Non-AI specialization)")
+    if role and _NON_AI_TITLE_RE.search(role) and not _AI_TITLE_RE.search(role):
+        return (False, f"Role '{role}' explicitly rejected (non-AI specialization)")
 
-    # 1. Direct match with AI_ROLE_KEYWORDS
-    for keyword in config.AI_ROLE_KEYWORDS:
-        kw_lower = keyword.lower()
-        if kw_lower in role_lower:
-            return (True, f"Role '{parsed.role}' matches AI keyword '{keyword}'")
+    m = _AI_TITLE_RE.search(role) if role else None
+    if m:
+        return (True, f"Role '{role}' matches AI keyword '{m.group(0)}'")
 
-    # 2. Match with the search keyword that found this post
-    keyword_matched = parsed.raw.keyword_matched.lower() if parsed.raw.keyword_matched else ""
-    if keyword_matched and keyword_matched != "direct_url":
-        # Remove location from keyword if present (e.g., 'ai engineer pune' -> 'ai engineer')
-        base_keyword = keyword_matched
+    keyword = (parsed.raw.keyword_matched or "").lower()
+    if keyword and keyword != "direct_url":
+        base_keyword = keyword
         for loc in config.TARGET_LOCATIONS:
-            if loc.lower() in base_keyword:
-                base_keyword = base_keyword.replace(loc.lower(), "").strip()
-                
-        if base_keyword and (base_keyword in role_lower or base_keyword in content_lower):
+            base_keyword = re.sub(r"\b" + re.escape(loc.lower()) + r"\b", "", base_keyword)
+        base_keyword = " ".join(base_keyword.split())
+        if base_keyword and re.search(r"\b" + re.escape(base_keyword) + r"\b", role + " " + content, re.IGNORECASE):
             return (True, f"Content/Role contains search keyword '{base_keyword}'")
 
-    # 3. Generic role + AI content
-    generic_roles = ["software engineer", "developer", "data scientist", "researcher", "engineer", "architect", "programmer"]
-    is_generic_role = any(r in role_lower for r in generic_roles) or not role_lower
-    
-    if is_generic_role:
-        strong_ai_keywords = ["llm", "langchain", "rag", "generative ai", "genai", "prompt engineering", "openai", "machine learning"]
-        for kw in strong_ai_keywords:
-            if kw in content_lower:
-                return (True, f"Generic role '{parsed.role}' but content has AI skill '{kw}'")
+    m = _STRONG_AI_RE.search(content)
+    if m:
+        return (True, f"Role '{role or 'unknown'}' but content has AI skill '{m.group(0)}'")
 
-    return (False, f"Role '{parsed.role}' and content do not meet AI criteria")
+    return (False, f"Role '{role or 'unknown'}' and content do not meet AI criteria")
 
 
 def apply_all_filters(parsed: ParsedPost,
                       target_locations: list[str] | None = None,
                       experience_range: tuple[int, int] | None = None,
+                      threshold: int | None = None,
+                      rescore: bool = True,
                       ) -> Optional[FilteredPost]:
-    """Apply all filters to a parsed post.
+    """Score the post and return a FilteredPost if it clears the threshold.
 
-    Returns a FilteredPost if all filters pass, None otherwise.
-    Filter order: hiring signal → experience → location → seniority.
-
-    Optional overrides:
-      target_locations — list of location strings to accept.
-      experience_range — (min, max) years of experience.
+    The score and its breakdown are always written onto ``parsed`` (and later
+    persisted), so rejected posts can be inspected and the weights tuned.
     """
+    if threshold is None:
+        threshold = config.RELEVANCE_THRESHOLD
 
-    # Filter 1: Is this strictly an AI/ML role?
-    passed, reason = filter_by_ai_role(parsed)
-    if not passed:
-        logger.info("REJECTED (non-AI role): %s — %s", parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn", reason)
-        return None
+    # rescore=False is used after an LLM pass has already set the score, so
+    # the rule engine does not overwrite the model's judgement.
+    if rescore:
+        score_post(parsed, target_locations=target_locations, experience_range=experience_range)
+    urn = parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn"
 
-    # Filter 2: Is this actually a hiring post?
-    passed, reason = filter_by_hiring_signal(parsed)
-    if not passed:
-        logger.info("REJECTED (hiring signal): %s — %s", parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn", reason)
-        return None
-
-    # Filter 3: Experience range check
-    exp_min = experience_range[0] if experience_range else None
-    exp_max = experience_range[1] if experience_range else None
-    passed, reason = filter_by_experience(parsed, user_min=exp_min, user_max=exp_max)
-    if not passed:
-        logger.info("REJECTED (experience): %s — %s", parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn", reason)
-        return None
-
-    # Filter 4: Location check
-    passed, reason = filter_by_location(parsed, target_locations=target_locations)
-    if not passed:
-        logger.info("REJECTED (location): %s — %s", parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn", reason)
-        return None
-
-    # Filter 5: Seniority check
-    passed, reason = filter_by_seniority(parsed)
-    if not passed:
-        logger.info("REJECTED (seniority): %s — %s", parsed.raw.post_urn[:30] if parsed.raw.post_urn else "no-urn", reason)
+    if parsed.relevance_score < threshold:
+        logger.info("REJECTED (score %d < %d): %s — %s", parsed.relevance_score, threshold, urn, parsed.filter_reason)
         return None
 
     logger.info(
-        "ACCEPTED: [%s] %s — %s | %s | %s",
-        parsed.raw.post_urn[:30],
-        parsed.role or "Unknown Role",
-        parsed.experience_str,
-        parsed.location_str,
-        reason,
+        "ACCEPTED (score %d): [%s] %s — %s | %s | %s",
+        parsed.relevance_score, urn, parsed.role or "Unknown Role",
+        parsed.experience_str, parsed.location_str, parsed.filter_reason,
     )
-
     return FilteredPost(
         parsed=parsed,
-        filter_reason=reason,
+        relevance_score=parsed.relevance_score,
+        filter_reason=parsed.filter_reason,
     )

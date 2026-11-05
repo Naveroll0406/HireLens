@@ -1,8 +1,12 @@
 """
 LinkedIn AI Job Post Monitor — Scheduler
 
-Runs the monitor pipeline on a configurable schedule using APScheduler.
-Default: every 60 minutes.
+Runs the monitor pipeline on a configurable schedule (plain asyncio loop,
+no extra dependencies). Default: every 60 minutes; the interval can be
+changed live from the dashboard (settings table).
+
+If LinkedIn blocks or challenges a run, the next BLOCKED_SKIP_INTERVALS
+scheduled runs are skipped so a flagged account isn't hammered.
 
 Usage:
   python scheduler.py                 # Run with default interval (60 min)
@@ -25,11 +29,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
 from main import run_pipeline, setup_logging
+from storage.database import Database
 
 logger = logging.getLogger(__name__)
 
 # Flag for graceful shutdown
 _shutdown_requested = False
+
+# Runs to skip after a block (set by scheduled_job, consumed by the loop)
+_skip_runs = 0
 
 
 def signal_handler(signum, frame):
@@ -41,25 +49,34 @@ def signal_handler(signum, frame):
 
 async def scheduled_job():
     """The job that runs on schedule."""
+    global _skip_runs
     if _shutdown_requested:
+        return
+
+    if _skip_runs > 0:
+        _skip_runs -= 1
+        logger.warning("⏭  Skipping this run (LinkedIn block backoff, %d more to skip).", _skip_runs)
         return
 
     logger.info("⏰ Scheduled run triggered at %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     try:
         stats = await run_pipeline(dry_run=False)
+        if stats.blocked:
+            _skip_runs = config.BLOCKED_SKIP_INTERVALS
+            logger.error(
+                "🚫 Run was blocked by LinkedIn. Backing off: skipping the next %d scheduled run(s). "
+                "Open the browser profile and clear any security check before then.",
+                _skip_runs,
+            )
         logger.info("✅ Scheduled run complete: %s", stats.summary())
     except Exception as e:
         logger.exception("❌ Scheduled run failed: %s", e)
 
 
 async def run_scheduler(interval_minutes: int, run_now: bool = False):
-    """Run the monitor on a recurring schedule.
-
-    Uses a simple asyncio loop instead of APScheduler for fewer dependencies
-    and better async compatibility.
-    """
-    global _shutdown_requested
+    """Run the monitor on a recurring schedule (simple asyncio loop)."""
+    global _shutdown_requested, _skip_runs
 
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -74,13 +91,23 @@ async def run_scheduler(interval_minutes: int, run_now: bool = False):
     logger.info("   Press Ctrl+C to stop")
     logger.info("=" * 70)
 
+    # If the last run before we started was blocked, start in backoff too.
+    try:
+        db = Database(config.DATABASE_PATH)
+        db.init_db()
+        if db.last_run_status() == "blocked":
+            _skip_runs = config.BLOCKED_SKIP_INTERVALS
+            logger.warning("Last recorded run was blocked; skipping the next %d run(s).", _skip_runs)
+        db.close()
+    except Exception as e:
+        logger.debug("Failed to read last run status: %s", e)
+
     if run_now:
         await scheduled_job()
 
     while not _shutdown_requested:
         # Dynamically fetch interval from database
         try:
-            from storage.database import Database
             db = Database(config.DATABASE_PATH)
             db.init_db()
             db_interval = db.get_setting("run_interval_minutes", "")
@@ -89,7 +116,7 @@ async def run_scheduler(interval_minutes: int, run_now: bool = False):
             db.close()
         except Exception as e:
             logger.debug("Failed to read dynamic interval from DB: %s", e)
-            
+
         interval_seconds = interval_minutes * 60
         next_run = datetime.now().strftime("%H:%M:%S")
         logger.info(
